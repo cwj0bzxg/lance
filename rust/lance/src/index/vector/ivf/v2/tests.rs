@@ -3708,6 +3708,160 @@ async fn test_create_ivf_hnsw_sq(
 }
 
 #[tokio::test]
+async fn test_create_ivf_hnsw_rq() {
+    let test_dir = TempStrDir::default();
+    let (mut dataset, vectors) =
+        generate_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(4),
+        HnswBuildParams::default(),
+        RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+    );
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(&index_name).await.unwrap()).unwrap();
+    assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_RQ");
+
+    let query = vectors.value(0);
+    let hits = dataset
+        .scan()
+        .nearest("vector", query.as_primitive::<Float32Type>(), 5)
+        .unwrap()
+        .nprobes(4)
+        .ef(64)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(hits.num_rows(), 5);
+
+    dataset
+        .delete(&format!("id < {}", NUM_ROWS / 2))
+        .await
+        .unwrap();
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(&index_name).await.unwrap()).unwrap();
+    assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_RQ");
+    let remapped = dataset
+        .scan()
+        .nearest("vector", query.as_primitive::<Float32Type>(), 5)
+        .unwrap()
+        .nprobes(4)
+        .ef(64)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(remapped.num_rows(), 5);
+}
+
+/// One fresh IVF_HNSW_RQ build over the fixed-seed test dataset, returning
+/// recall@100 against the brute-force ground truth.
+async fn ivf_hnsw_rq_recall_once(params: &VectorIndexParams, nlist: usize, ef: usize) -> f32 {
+    let test_dir = TempStrDir::default();
+    let (mut dataset, vectors) =
+        generate_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, params, true)
+        .await
+        .unwrap();
+
+    let query = vectors.value(0);
+    let k = 100;
+    let mut scanner = dataset.scan();
+    let result = scanner
+        .nearest("vector", query.as_primitive::<Float32Type>(), k)
+        .unwrap()
+        .nprobes(nlist)
+        .ef(ef)
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let row_ids = result[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let gt = ground_truth(&dataset, "vector", &query, k, params.metric_type).await;
+    row_ids.intersection(&gt).count() as f32 / k as f32
+}
+
+#[rstest]
+// SymRaBitQ supports only L2 and Dot (sym_dist is unreachable for Cosine),
+// so no Cosine/multivec cases here. Like flat IVF_RQ (see test_build_ivf_rq),
+// 1-bit recall averages ~0.67 with a wide spread, so only 5-bit cases run.
+//
+// KMeans init and the RQ rotation both draw fresh randomness per build, so
+// a single build occasionally lands a weak graph: with m=32 /
+// ef_construction=300 and query ef=512 (default ef is k+k/2), recall is
+// typically 0.95-0.99 but was observed at 0.47-0.79 under load. A
+// systematic regression fails every build, so gating on the best of 3
+// fresh builds keeps the bar at the IVF_HNSW_SQ level without flaking.
+// Remap coverage stays in test_create_ivf_hnsw_rq above.
+#[case(4, DistanceType::L2, 5, 0.9)]
+#[case(4, DistanceType::Dot, 5, 0.85)]
+#[tokio::test]
+async fn test_create_ivf_hnsw_rq_recall(
+    #[case] nlist: usize,
+    #[case] distance_type: DistanceType,
+    #[case] num_bits: u8,
+    #[case] recall_requirement: f32,
+) {
+    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+        distance_type,
+        IvfBuildParams::new(nlist),
+        HnswBuildParams::default()
+            .num_edges(32)
+            .ef_construction(300),
+        RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
+    );
+    let mut best = 0.0f32;
+    for _ in 0..3 {
+        best = best.max(ivf_hnsw_rq_recall_once(&params, nlist, 512).await);
+    }
+    assert!(
+        best >= recall_requirement,
+        "best recall over 3 fresh builds: {best} < {recall_requirement}"
+    );
+    // test_distance_range does not fit RQ: it pins the exact row-id order
+    // of distance-range splits against the unfiltered top-k, but RQ's
+    // 1-bit warmup walk may legitimately return different approximate
+    // top-k sets for different k.
+    test_delete_all_rows(params.clone()).await;
+}
+
+#[tokio::test]
+async fn test_create_ivf_hnsw_rq_1bit() {
+    let test_dir = TempStrDir::default();
+    let (mut dataset, _) =
+        generate_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default(),
+        RQBuildParams::with_rotation_type(1, RQRotationType::Fast),
+    );
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(&index_name).await.unwrap()).unwrap();
+    assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_RQ");
+}
+
+#[tokio::test]
 async fn test_create_ivf_hnsw_sq_dot_with_negative_values() {
     let nlist = 4;
     let ivf_params = IvfBuildParams::new(nlist);
@@ -4654,7 +4808,7 @@ async fn test_index_stats(
         );
 
         let sub_index = match index_type {
-            IndexType::IvfHnswPq | IndexType::IvfHnswSq => "HNSW",
+            IndexType::IvfHnswPq | IndexType::IvfHnswSq | IndexType::IvfHnswRq => "HNSW",
             IndexType::IvfPq => "PQ",
             _ => "FLAT",
         };

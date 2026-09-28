@@ -102,7 +102,7 @@ impl Default for HnswBuildParams {
             max_level: 7,
             m: 20,
             ef_construction: 150,
-            prefetch_distance: Some(2),
+            prefetch_distance: Some(6),
         }
     }
 }
@@ -1721,8 +1721,11 @@ impl IvfSubIndex for HNSW {
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let (results, comparisons) = if prefilter.is_empty() {
-            self.search_basic(query, k, &params, None, storage)?
+        let rerank_query = query.clone();
+        // Keep `ef` candidates so RQ can rescore them; FLAT/PQ/SQ rerank
+        // is truncate-only, so the extra ids are dropped immediately.
+        let (mut results, comparisons) = if prefilter.is_empty() {
+            self.search_basic(query, params.ef, &params, None, storage)?
         } else {
             // the bitset must be moved into a callee on every path so its
             // borrow of `prefilter_generator` ends before the push below
@@ -1735,7 +1738,7 @@ impl IvfSubIndex for HNSW {
             if remained == storage.len() {
                 // mask passes every row: same as unfiltered
                 drop(prefilter_bitset);
-                self.search_basic(query, k, &params, None, storage)?
+                self.search_basic(query, params.ef, &params, None, storage)?
             } else if remained < self.len() * 10 / 100 {
                 // few matching rows: brute force is cheaper and exact
                 self.flat_search(storage, query, k, prefilter_bitset, &params)
@@ -1749,19 +1752,20 @@ impl IvfSubIndex for HNSW {
                 if !bounded && acorn_results.len() < k.min(remained) {
                     // the abandoned ACORN traversal still cost its distances
                     let (results, basic_comparisons) =
-                        self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
+                        self.search_basic(query, params.ef, &params, Some(prefilter_bitset), storage)?;
                     (results, acorn_comparisons + basic_comparisons)
                 } else {
                     drop(prefilter_bitset);
                     (acorn_results, acorn_comparisons)
                 }
             } else {
-                self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
+                self.search_basic(query, params.ef, &params, Some(prefilter_bitset), storage)?
             }
         };
         metrics.record_comparisons(comparisons);
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
+        storage.rerank(rerank_query, params.dist_q_c, k, &mut results);
 
         // need to unique by row ids in case of searching multivector
         let (row_ids, dists): (Vec<_>, Vec<_>) = results
