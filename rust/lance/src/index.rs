@@ -4566,6 +4566,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))

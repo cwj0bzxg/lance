@@ -3857,24 +3857,21 @@ fn repeated_rows_fsl(dtype: &DataType, row_values: &[f32], dim: usize) -> FixedS
                 .iter()
                 .flat_map(|value| repeat_n(half::f16::from_f32(*value), dim))
                 .collect::<Vec<_>>();
-            FixedSizeListArray::try_new_from_values(Float16Array::from(values), dim as i32)
-                .unwrap()
+            FixedSizeListArray::try_new_from_values(Float16Array::from(values), dim as i32).unwrap()
         }
         DataType::Float32 => {
             let values = row_values
                 .iter()
                 .flat_map(|value| repeat_n(*value, dim))
                 .collect::<Vec<_>>();
-            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32)
-                .unwrap()
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap()
         }
         DataType::Float64 => {
             let values = row_values
                 .iter()
                 .flat_map(|value| repeat_n(*value as f64, dim))
                 .collect::<Vec<_>>();
-            FixedSizeListArray::try_new_from_values(Float64Array::from(values), dim as i32)
-                .unwrap()
+            FixedSizeListArray::try_new_from_values(Float64Array::from(values), dim as i32).unwrap()
         }
         other => panic!("unsupported vector type {other}"),
     }
@@ -3882,9 +3879,7 @@ fn repeated_rows_fsl(dtype: &DataType, row_values: &[f32], dim: usize) -> FixedS
 
 fn scalar_vector(dtype: &DataType, value: f32, dim: usize) -> ArrayRef {
     match dtype {
-        DataType::Float16 => {
-            Arc::new(Float16Array::from(vec![half::f16::from_f32(value); dim]))
-        }
+        DataType::Float16 => Arc::new(Float16Array::from(vec![half::f16::from_f32(value); dim])),
         DataType::Float32 => Arc::new(Float32Array::from(vec![value; dim])),
         DataType::Float64 => Arc::new(Float64Array::from(vec![value as f64; dim])),
         other => panic!("unsupported vector type {other}"),
@@ -3971,8 +3966,7 @@ async fn test_create_ivf_hnsw_rq_recall(
 #[tokio::test]
 async fn test_create_ivf_hnsw_rq_1bit() {
     let test_dir = TempStrDir::default();
-    let (mut dataset, _) =
-        generate_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
     let params = VectorIndexParams::with_ivf_hnsw_rq_params(
         DistanceType::L2,
         IvfBuildParams::new(2),
