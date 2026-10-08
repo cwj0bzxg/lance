@@ -1270,10 +1270,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         if Q::quantization_type() == QuantizationType::Rabit
             && let Ok(Quantizer::Rabit(rq)) = storage.quantizer()
         {
-            // SymRaBitQ (IVF_HNSW_RQ) walks on the residual 1-bit warmup, so
-            // it needs the residual query even though its estimator is raw.
-            return rq.metadata_ref().uses_sym_columns()
-                || rq.metadata_ref().query_estimator == RabitQueryEstimator::ResidualQuery;
+            // Sym columns are scored as a raw query. Their stored factors
+            // already include the centroid, and HNSW ignores QueryResidual.
+            return rq.metadata_ref().query_estimator == RabitQueryEstimator::ResidualQuery;
         }
         Q::use_residual(distance_type)
     }
