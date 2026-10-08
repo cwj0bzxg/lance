@@ -4026,7 +4026,7 @@ impl Dataset {
                             object_store.clone(),
                             index_dir,
                             uuid.to_owned(),
-                            frag_reuse_index,
+                            remapping,
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
