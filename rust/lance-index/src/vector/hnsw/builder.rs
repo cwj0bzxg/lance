@@ -103,7 +103,7 @@ impl Default for HnswBuildParams {
             max_level: 7,
             m: 20,
             ef_construction: 150,
-            prefetch_distance: Some(6),
+            prefetch_distance: Some(2),
         }
     }
 }
@@ -1722,8 +1722,8 @@ impl IvfSubIndex for HNSW {
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
         let rerank_query = query.clone();
-        // Keep `ef` candidates so RQ can rescore them; FLAT/PQ/SQ rerank
-        // is truncate-only, so the extra ids are dropped immediately.
+        // Every path keeps `ef` candidates so RQ can rescore them; for FLAT,
+        // PQ and SQ the scores are final and rerank only truncates to `k`.
         let (mut results, comparisons) = if prefilter.is_empty() {
             self.search_basic(query, params.ef, &params, None, storage)?
         } else {
@@ -1741,10 +1741,15 @@ impl IvfSubIndex for HNSW {
                 self.search_basic(query, params.ef, &params, None, storage)?
             } else if remained < self.len() * 10 / 100 {
                 // few matching rows: brute force is cheaper and exact
-                self.flat_search(storage, query, k, prefilter_bitset, &params)
+                self.flat_search(storage, query, params.ef, prefilter_bitset, &params)
             } else if params.use_acorn {
-                let (acorn_results, acorn_comparisons) =
-                    self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
+                let (acorn_results, acorn_comparisons) = self.search_acorn(
+                    query.clone(),
+                    params.ef,
+                    &params,
+                    &prefilter_bitset,
+                    storage,
+                )?;
                 // under-delivery means the budget ran out on a fragmented
                 // mask, except range-bounded queries which return short
                 // legitimately

@@ -7,7 +7,10 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use arrow_array::{FixedSizeListArray, RecordBatch, UInt64Array, types::Float32Type};
+use arrow_array::{
+    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, UInt64Array,
+    types::Float32Type,
+};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::FixedSizeListArrayExt;
@@ -16,13 +19,21 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_testing::pprof::{Output, PProfProfiler};
 use rayon::ThreadPoolBuilder;
 
-use lance_core::ROW_ID_FIELD;
+use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::prefilter::NoFilter;
+use lance_index::vector::transform::Transformer;
 use lance_index::vector::{
+    CENTROID_DIST_COLUMN, PART_ID_COLUMN,
+    bq::{
+        RQBuildParams, builder::RabitQuantizer, storage::RabitQuantizationStorage,
+        transform::RQTransformer,
+    },
     flat::storage::FlatFloatStorage,
     graph::VisitedGenerator,
     hnsw::builder::{HNSW, HnswBuildParams, HnswQueryParams},
     pq::{PQBuildParams, ProductQuantizer},
-    quantizer::Quantization,
+    quantizer::{Quantization, QuantizerStorage},
     sq::{ScalarQuantizer, builder::SQBuildParams},
     storage::{StorageBuilder, VectorStore},
 };
@@ -360,6 +371,93 @@ fn bench_hnsw_pq(c: &mut Criterion) {
     });
 }
 
+/// `IVF_HNSW_RQ` builds its graph from code-to-code distances and searches
+/// with the 1-bit walk plus a multi-bit rerank.
+fn bench_hnsw_rq(c: &mut Criterion) {
+    const DIMENSION: usize = 128;
+    const TOTAL: usize = 100_000;
+    const SEED: [u8; 32] = [42; 32];
+    const K: usize = 100;
+
+    let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
+    let norms: Vec<f32> = data
+        .values()
+        .as_chunks::<DIMENSION>()
+        .0
+        .iter()
+        .map(|vector| vector.iter().map(|value| value * value).sum())
+        .collect();
+    let fsl = FixedSizeListArray::try_new_from_values(data, DIMENSION as i32).unwrap();
+    let params = RQBuildParams {
+        with_sym_columns: true,
+        ..Default::default()
+    };
+    let quantizer = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap();
+    // One partition around a zero centroid: the residuals are the vectors.
+    let centroids = FixedSizeListArray::try_new_from_values(
+        Float32Array::from(vec![0.0; DIMENSION]),
+        DIMENSION as i32,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_from_iter(vec![
+        ("vector", Arc::new(fsl.clone()) as ArrayRef),
+        (
+            PART_ID_COLUMN,
+            Arc::new(UInt32Array::from(vec![0; TOTAL])) as ArrayRef,
+        ),
+        (
+            CENTROID_DIST_COLUMN,
+            Arc::new(Float32Array::from(norms.clone())) as ArrayRef,
+        ),
+        (
+            ROW_ID,
+            Arc::new(UInt64Array::from_iter_values(0..TOTAL as u64)) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let encoded = RQTransformer::new(quantizer.clone(), DistanceType::L2, centroids, "vector")
+        .unwrap()
+        .transform(&batch)
+        .unwrap();
+    let storage = RabitQuantizationStorage::try_from_batch(
+        encoded,
+        &quantizer.metadata(None),
+        DistanceType::L2,
+        None,
+    )
+    .unwrap();
+
+    c.bench_function(
+        format!("create_hnsw_rq({TOTAL}x{DIMENSION})").as_str(),
+        |b| b.iter(|| HNSW::index_vectors(&storage, HnswBuildParams::default()).unwrap()),
+    );
+
+    let hnsw = HNSW::index_vectors(&storage, HnswBuildParams::default()).unwrap();
+    let query = fsl.value(0);
+    let params = HnswQueryParams {
+        ef: 300,
+        lower_bound: None,
+        upper_bound: None,
+        dist_q_c: norms[0],
+        use_acorn: false,
+    };
+    c.bench_function(format!("search_hnsw_rq{TOTAL}x{DIMENSION}").as_str(), |b| {
+        b.iter(|| {
+            let results = hnsw
+                .search(
+                    query.clone(),
+                    K,
+                    params,
+                    &storage,
+                    Arc::new(NoFilter),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            assert_eq!(results.num_rows(), K);
+        })
+    });
+}
+
 /// Measure how the look-ahead prefetch distance affects flat-storage search
 /// latency across vector sizes (issue #8275).
 ///
@@ -429,7 +527,7 @@ criterion_group!(
         .measurement_time(Duration::from_secs(10))
         .sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_hnsw, bench_hnsw_load, bench_hnsw_sq, bench_hnsw_pq, bench_hnsw_prefetch);
+    targets = bench_hnsw, bench_hnsw_load, bench_hnsw_sq, bench_hnsw_pq, bench_hnsw_rq, bench_hnsw_prefetch);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
@@ -438,6 +536,6 @@ criterion_group!(
     config = Criterion::default()
         .measurement_time(Duration::from_secs(10))
         .sample_size(10);
-    targets = bench_hnsw, bench_hnsw_load, bench_hnsw_sq, bench_hnsw_pq, bench_hnsw_prefetch);
+    targets = bench_hnsw, bench_hnsw_load, bench_hnsw_sq, bench_hnsw_pq, bench_hnsw_rq, bench_hnsw_prefetch);
 
 criterion_main!(benches);

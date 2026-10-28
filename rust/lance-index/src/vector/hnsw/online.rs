@@ -757,7 +757,7 @@ mod tests {
                 None,
                 &mut visited,
                 storage.as_ref(),
-                Some(6),
+                Some(2),
             )
             .unwrap();
 

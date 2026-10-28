@@ -262,11 +262,6 @@ fn process_neighbors_with_look_ahead<F>(
 {
     match look_ahead {
         Some(look_ahead) => {
-            // Prime the pipeline, otherwise the first `look_ahead` neighbors of
-            // every hop are fetched cold.
-            for neighbor in neighbors.iter().take(look_ahead) {
-                dist_calc.prefetch(*neighbor);
-            }
             for i in 0..neighbors.len().saturating_sub(look_ahead) {
                 dist_calc.prefetch(neighbors[i + look_ahead]);
                 process_neighbor(neighbors[i]);
@@ -479,21 +474,20 @@ pub fn beam_search(
     (results.into_sorted_vec(), comparisons)
 }
 
-/// Accepts walk scores in `[lower_bound, upper_bound)`. Calculators whose walk
-/// scores are replaced by rerank judge the reranked score instead.
+/// Accepts walk scores in `[lower_bound, upper_bound)`. A bounded query asks
+/// the calculator, whose walk score may be replaced by rerank.
 pub(crate) fn range_filter<'a, C: DistCalculator>(
     params: &HnswQueryParams,
     dist_calc: &'a C,
 ) -> impl Fn(u32, OrderedFloat) -> bool + use<'a, C> {
-    let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
-    let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
-    let refine =
-        (params.lower_bound.is_some() || params.upper_bound.is_some()) && dist_calc.refines_range();
+    let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
+    let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
+    let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
     move |node_id, dist| {
-        if refine {
-            dist_calc.in_range(node_id, dist.0, lower_bound.0, upper_bound.0)
+        if bounded {
+            dist_calc.in_range(node_id, dist.0, lower_bound, upper_bound)
         } else {
-            dist >= lower_bound && dist < upper_bound
+            dist.0 >= lower_bound && dist.0 < upper_bound
         }
     }
 }

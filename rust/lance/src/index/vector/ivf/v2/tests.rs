@@ -15,9 +15,8 @@ use all_asserts::{assert_ge, assert_lt};
 use arrow::datatypes::{Float64Type, UInt8Type, UInt32Type, UInt64Type};
 use arrow::{array::AsArray, datatypes::Float32Type};
 use arrow_array::{
-    Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float16Array, Float32Array,
-    Float64Array, Int64Array, ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator,
-    UInt64Array,
+    Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array, ListArray,
+    PrimitiveArray, RecordBatch, RecordBatchIterator, UInt64Array,
 };
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -3708,60 +3707,32 @@ async fn test_create_ivf_hnsw_sq(
     test_remap(params, nlist, recall_requirement).await;
 }
 
+// Like flat IVF_RQ (see test_build_ivf_rq), 1 bit per dimension recalls far
+// less than 5 bits on this uniformly random data.
+#[rstest]
+#[case(4, DistanceType::L2, 5, 0.9)]
+#[case(4, DistanceType::Cosine, 5, 0.9)]
+#[case(4, DistanceType::Dot, 5, 0.85)]
+#[case(4, DistanceType::L2, 1, 0.5)]
 #[tokio::test]
-async fn test_create_ivf_hnsw_rq() {
-    let test_dir = TempStrDir::default();
-    let (mut dataset, vectors) =
-        generate_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+async fn test_create_ivf_hnsw_rq(
+    #[case] nlist: usize,
+    #[case] distance_type: DistanceType,
+    #[case] num_bits: u8,
+    #[case] recall_requirement: f32,
+) {
     let params = VectorIndexParams::with_ivf_hnsw_rq_params(
-        DistanceType::L2,
-        IvfBuildParams::new(4),
+        distance_type,
+        IvfBuildParams::new(nlist),
         HnswBuildParams::default(),
-        RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+        RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
     );
-    dataset
-        .create_index(&["vector"], IndexType::Vector, None, &params, true)
-        .await
-        .unwrap();
-
-    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
-    let stats: serde_json::Value =
-        serde_json::from_str(&dataset.index_statistics(&index_name).await.unwrap()).unwrap();
-    assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_RQ");
-
-    let query = vectors.value(0);
-    let hits = dataset
-        .scan()
-        .nearest("vector", query.as_primitive::<Float32Type>(), 5)
-        .unwrap()
-        .nprobes(4)
-        .ef(64)
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(hits.num_rows(), 5);
-
-    dataset
-        .delete(&format!("id < {}", NUM_ROWS / 2))
-        .await
-        .unwrap();
-    compact_files(&mut dataset, CompactionOptions::default(), None)
-        .await
-        .unwrap();
-
-    let stats: serde_json::Value =
-        serde_json::from_str(&dataset.index_statistics(&index_name).await.unwrap()).unwrap();
-    assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_RQ");
-    let remapped = dataset
-        .scan()
-        .nearest("vector", query.as_primitive::<Float32Type>(), 5)
-        .unwrap()
-        .nprobes(4)
-        .ef(64)
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(remapped.num_rows(), 5);
+    // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+    Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+    // test_distance_range pins the row-id order of range splits against the
+    // unfiltered top-k, which a 1-bit walk need not reproduce for every k.
+    Box::pin(test_delete_all_rows(params.clone())).await;
+    test_remap(params, nlist, recall_requirement).await;
 }
 
 /// Nonzero centroids stored as Float16 or Float64 must be scored with the
@@ -3780,27 +3751,15 @@ async fn test_ivf_hnsw_rq_nonzero_centroid_keeps_raw_query(
 ) {
     const DIM: usize = 8;
     // [0], [1.1], [1.9] against query and centroid [1]. Exact nearest is id 1.
-    let vectors = repeated_rows_fsl(&dtype, &[0.0, 1.1, 1.9], DIM);
-    let centroids = repeated_rows_fsl(&dtype, &[1.0], DIM);
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::UInt64, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", dtype.clone(), true)),
-                DIM as i32,
-            ),
-            false,
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as ArrayRef,
         ),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
-            Arc::new(vectors),
-        ],
-    )
+        ("vector", repeated_rows(&dtype, &[0.0, 1.1, 1.9], DIM)),
+    ])
     .unwrap();
+    let schema = batch.schema();
     let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
     let test_dir = TempStrDir::default();
     let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
@@ -3809,7 +3768,15 @@ async fn test_ivf_hnsw_rq_nonzero_centroid_keeps_raw_query(
 
     let params = VectorIndexParams::with_ivf_hnsw_rq_params(
         DistanceType::L2,
-        IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        IvfBuildParams::try_with_centroids(
+            1,
+            Arc::new(
+                repeated_rows(&dtype, &[1.0], DIM)
+                    .as_fixed_size_list()
+                    .clone(),
+            ),
+        )
+        .unwrap(),
         HnswBuildParams::default(),
         RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
     );
@@ -3833,7 +3800,9 @@ async fn test_ivf_hnsw_rq_nonzero_centroid_keeps_raw_query(
         "centroid dtype changed during the build, so this case no longer hits the residual path"
     );
 
-    let query = scalar_vector(&dtype, 1.0, DIM);
+    let query = repeated_rows(&dtype, &[1.0], DIM)
+        .as_fixed_size_list()
+        .value(0);
     let hits = dataset
         .scan()
         .nearest("vector", query.as_ref(), 1)
@@ -3850,137 +3819,16 @@ async fn test_ivf_hnsw_rq_nonzero_centroid_keeps_raw_query(
     );
 }
 
-fn repeated_rows_fsl(dtype: &DataType, row_values: &[f32], dim: usize) -> FixedSizeListArray {
-    match dtype {
-        DataType::Float16 => {
-            let values = row_values
-                .iter()
-                .flat_map(|value| repeat_n(half::f16::from_f32(*value), dim))
-                .collect::<Vec<_>>();
-            FixedSizeListArray::try_new_from_values(Float16Array::from(values), dim as i32).unwrap()
-        }
-        DataType::Float32 => {
-            let values = row_values
-                .iter()
-                .flat_map(|value| repeat_n(*value, dim))
-                .collect::<Vec<_>>();
-            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap()
-        }
-        DataType::Float64 => {
-            let values = row_values
-                .iter()
-                .flat_map(|value| repeat_n(*value as f64, dim))
-                .collect::<Vec<_>>();
-            FixedSizeListArray::try_new_from_values(Float64Array::from(values), dim as i32).unwrap()
-        }
-        other => panic!("unsupported vector type {other}"),
-    }
-}
-
-fn scalar_vector(dtype: &DataType, value: f32, dim: usize) -> ArrayRef {
-    match dtype {
-        DataType::Float16 => Arc::new(Float16Array::from(vec![half::f16::from_f32(value); dim])),
-        DataType::Float32 => Arc::new(Float32Array::from(vec![value; dim])),
-        DataType::Float64 => Arc::new(Float64Array::from(vec![value as f64; dim])),
-        other => panic!("unsupported vector type {other}"),
-    }
-}
-
-/// One fresh IVF_HNSW_RQ build over the fixed-seed test dataset, returning
-/// recall@100 against the brute-force ground truth.
-async fn ivf_hnsw_rq_recall_once(params: &VectorIndexParams, nlist: usize, ef: usize) -> f32 {
-    let test_dir = TempStrDir::default();
-    let (mut dataset, vectors) =
-        generate_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
-    dataset
-        .create_index(&["vector"], IndexType::Vector, None, params, true)
-        .await
-        .unwrap();
-
-    let query = vectors.value(0);
-    let k = 100;
-    let mut scanner = dataset.scan();
-    let result = scanner
-        .nearest("vector", query.as_primitive::<Float32Type>(), k)
-        .unwrap()
-        .nprobes(nlist)
-        .ef(ef)
-        .with_row_id()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let row_ids = result[ROW_ID]
-        .as_primitive::<UInt64Type>()
-        .values()
+/// One row of `dim` copies per value, as a vector column of `dtype`.
+fn repeated_rows(dtype: &DataType, values: &[f32], dim: usize) -> ArrayRef {
+    let values: Vec<f32> = values
         .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    let gt = ground_truth(&dataset, "vector", &query, k, params.metric_type).await;
-    row_ids.intersection(&gt).count() as f32 / k as f32
-}
-
-#[rstest]
-// SymRaBitQ supports only L2 and Dot (sym_dist is unreachable for Cosine),
-// so no Cosine/multivec cases here. Like flat IVF_RQ (see test_build_ivf_rq),
-// 1-bit recall averages ~0.67 with a wide spread, so only 5-bit cases run.
-//
-// KMeans init and the RQ rotation both draw fresh randomness per build, so
-// a single build occasionally lands a weak graph: with m=32 /
-// ef_construction=300 and query ef=512 (default ef is k+k/2), recall is
-// typically 0.95-0.99 but was observed at 0.47-0.79 under load. A
-// systematic regression fails every build, so gating on the best of 3
-// fresh builds keeps the bar at the IVF_HNSW_SQ level without flaking.
-// Remap coverage stays in test_create_ivf_hnsw_rq above.
-#[case(4, DistanceType::L2, 5, 0.9)]
-#[case(4, DistanceType::Dot, 5, 0.85)]
-#[tokio::test]
-async fn test_create_ivf_hnsw_rq_recall(
-    #[case] nlist: usize,
-    #[case] distance_type: DistanceType,
-    #[case] num_bits: u8,
-    #[case] recall_requirement: f32,
-) {
-    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
-        distance_type,
-        IvfBuildParams::new(nlist),
-        HnswBuildParams::default()
-            .num_edges(32)
-            .ef_construction(300),
-        RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
-    );
-    let mut best = 0.0f32;
-    for _ in 0..3 {
-        best = best.max(ivf_hnsw_rq_recall_once(&params, nlist, 512).await);
-    }
-    assert!(
-        best >= recall_requirement,
-        "best recall over 3 fresh builds: {best} < {recall_requirement}"
-    );
-    // test_distance_range does not fit RQ: it pins the exact row-id order
-    // of distance-range splits against the unfiltered top-k, but RQ's
-    // 1-bit warmup walk may legitimately return different approximate
-    // top-k sets for different k.
-    test_delete_all_rows(params.clone()).await;
-}
-
-#[tokio::test]
-async fn test_create_ivf_hnsw_rq_1bit() {
-    let test_dir = TempStrDir::default();
-    let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
-    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
-        DistanceType::L2,
-        IvfBuildParams::new(2),
-        HnswBuildParams::default(),
-        RQBuildParams::with_rotation_type(1, RQRotationType::Fast),
-    );
-    dataset
-        .create_index(&["vector"], IndexType::Vector, None, &params, true)
-        .await
-        .unwrap();
-    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
-    let stats: serde_json::Value =
-        serde_json::from_str(&dataset.index_statistics(&index_name).await.unwrap()).unwrap();
-    assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_RQ");
+        .flat_map(|value| repeat_n(*value, dim))
+        .collect();
+    let rows =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap();
+    let item = Arc::new(Field::new("item", dtype.clone(), true));
+    arrow::compute::cast(&rows, &DataType::FixedSizeList(item, dim as i32)).unwrap()
 }
 
 #[tokio::test]
@@ -4889,6 +4737,12 @@ async fn test_index_stats(
                 Default::default(),
                 Default::default()
             ), IndexType::IvfHnswSq),
+            (VectorIndexParams::with_ivf_hnsw_rq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(2),
+                Default::default(),
+                Default::default()
+            ), IndexType::IvfHnswRq),
         )]
     index: (VectorIndexParams, IndexType),
 ) {

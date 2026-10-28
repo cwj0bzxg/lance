@@ -1,360 +1,218 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! SymRaBitQ helpers for HNSW graph construction and Residual 1-bit search.
+//! SymRaBitQ: distances between two RaBitQ codes.
 //!
-//! BE 1-bit pack plus the symmetric estimator. Residual `distance(id)` uses
-//! Lib `quantize_scalar` + `warmup_ip_x0_q`. Flat `distance_all` stays on
-//! the existing FastScan path.
+//! `IVF_HNSW_RQ` builds its graph without the raw vectors, so the edges are
+//! scored between two RaBitQ codes with the symmetric estimator in
+//! [`sym_dist`]. The graph walk scores the query against the 1-bit codes
+//! only: the query is quantized to 4 bits ([`prepare_residual_warmup_query`])
+//! so that AND + popcount replaces the float inner product.
+//!
+//! "Lib" refers to the reference RaBitQ-Library. These kernels reproduce its
+//! layouts and numerics; `testdata/symrabitq` holds its outputs.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::LazyLock;
 
+use lance_linalg::distance::DistanceType;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 
-/// Bytes needed for a Lib `pack_binary` column: one `u64` word per 64 dims,
-/// rounded up, last word zero-padded.
-pub fn sym_bin_code_bytes(code_dim: usize) -> usize {
-    code_dim.div_ceil(64) * 8
+/// Bytes per row of sign words: one `u64` per 64 dims, the last one
+/// zero-padded.
+pub fn sign_word_bytes(dim: usize) -> usize {
+    dim.div_ceil(64) * 8
 }
 
-/// Pack residual signs the way RaBitQ-Lib `pack_binary` does:
-/// `residual > 0` → 1; each 64-dim word is bit-endian (dim 0 at bit 63);
-/// each word is stored as little-endian bytes.
-pub fn pack_binary_be(residual: &[f32], out: &mut [u8]) {
-    debug_assert_eq!(out.len(), sym_bin_code_bytes(residual.len()));
-    out.fill(0);
-    for (word_idx, chunk) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-        let start = word_idx * 64;
-        let end = residual.len().min(start + 64);
-        let mut word = 0u64;
-        for (offset, &value) in residual[start..end].iter().enumerate() {
-            if value > 0.0 {
-                word |= 1u64 << (63 - offset);
-            }
-        }
-        *chunk = word.to_le_bytes();
-    }
-}
-
-/// Rewrite LSB-first `_rabit_codes` bytes into Lib `pack_binary` BE words.
-pub fn pack_binary_be_from_le(le: &[u8], dim: usize, out: &mut [u8]) {
-    debug_assert_eq!(out.len(), sym_bin_code_bytes(dim));
-    debug_assert!(le.len() >= dim.div_ceil(8));
-    out.fill(0);
-    for (word_idx, chunk) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-        let start = word_idx * 64;
-        let end = dim.min(start + 64);
-        let mut word = 0u64;
-        for dim_idx in start..end {
-            if le[dim_idx / 8] & (1u8 << (dim_idx % 8)) != 0 {
-                word |= 1u64 << (63 - (dim_idx - start));
-            }
-        }
-        *chunk = word.to_le_bytes();
-    }
-}
-
-/// Lib `mask_ip_x0_q`: sum of `query[d]` where the BE 1-bit code is set.
-///
-/// `query` must cover every 64-dim word in `data_be` (zero-pad the tail).
-#[inline]
-pub fn mask_ip_x0_q(query: &[f32], data_be: &[u8]) -> f32 {
-    debug_assert!(data_be.len().is_multiple_of(8));
-    debug_assert!(query.len() >= (data_be.len() / 8) * 64);
-    #[cfg(target_arch = "x86_64")]
+/// Regroups the sign bits of row-major `_rabit_codes` (dim `i` at bit `i % 8`
+/// of byte `i / 8`) into the sign words the kernels read: one little-endian
+/// `u64` per 64 dims with the first dim at bit 63, as Lib packs them.
+pub fn sign_words_from_codes(codes: &[u8], code_len: usize) -> Vec<u8> {
+    let word_bytes = sign_word_bytes(code_len * 8);
+    let mut words = vec![0u8; codes.len() / code_len * word_bytes];
+    for (row, row_words) in codes
+        .chunks_exact(code_len)
+        .zip(words.chunks_exact_mut(word_bytes))
     {
-        if std::is_x86_feature_detected!("avx512f") {
-            return unsafe { mask_ip_avx512::mask_ip_x0_q(query, data_be) };
-        }
-        if std::is_x86_feature_detected!("avx2") {
-            return unsafe { mask_ip_avx2::mask_ip_x0_q(query, data_be) };
-        }
-    }
-    mask_ip_x0_q_scalar(query, data_be)
-}
-
-#[inline]
-pub(crate) fn mask_ip_x0_q_scalar(query: &[f32], data_be: &[u8]) -> f32 {
-    let mut sum = 0.0f32;
-    for (word_idx, chunk) in data_be.as_chunks::<8>().0.iter().enumerate() {
-        let bits = u64::from_le_bytes(*chunk).reverse_bits();
-        let base = word_idx * 64;
-        let mut bits = bits;
-        for offset in 0..64 {
-            if bits & 1 != 0 {
-                sum += query[base + offset];
-            }
-            bits >>= 1;
+        for (bytes, word) in row.chunks(8).zip(row_words.as_chunks_mut::<8>().0) {
+            let mut le = [0u8; 8];
+            le[..bytes.len()].copy_from_slice(bytes);
+            *word = u64::from_le_bytes(le).reverse_bits().to_le_bytes();
         }
     }
-    sum
+    words
 }
 
-#[cfg(target_arch = "x86_64")]
-mod mask_ip_avx2 {
-    use std::arch::x86_64::*;
-
-    /// Lib AVX2 `mask_ip_x0_q`: 8-wide bit-mask AND of the reversed word.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn mask_ip_x0_q(query: &[f32], data_be: &[u8]) -> f32 {
-        let num_blk = data_be.len() / 8;
-        let mut data_ptr = data_be.as_ptr() as *const u64;
-        let mut query_ptr = query.as_ptr();
-        let bit_checker = _mm256_set_epi32(0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
-        let mut sum = _mm256_setzero_ps();
-        for _ in 0..num_blk {
-            let bits = (*data_ptr).reverse_bits();
-            data_ptr = data_ptr.add(1);
-            for lane in 0..8 {
-                let current_byte = ((bits >> (lane * 8)) & 0xff) as i32;
-                let v_byte = _mm256_set1_epi32(current_byte);
-                let masked_bits = _mm256_and_si256(v_byte, bit_checker);
-                let mask = _mm256_cmpgt_epi32(masked_bits, _mm256_setzero_si256());
-                let q_vals = _mm256_loadu_ps(query_ptr);
-                sum = _mm256_add_ps(sum, _mm256_and_ps(q_vals, _mm256_castsi256_ps(mask)));
-                query_ptr = query_ptr.add(8);
-            }
-        }
-        let mut lanes = [0.0f32; 8];
-        _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
-        lanes.iter().sum()
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-mod mask_ip_avx512 {
-    use std::arch::x86_64::*;
-
-    /// Lib AVX-512 `mask_ip_x0_q`: four 16-wide masked loads per 64-dim word.
-    #[target_feature(enable = "avx512f")]
-    pub unsafe fn mask_ip_x0_q(query: &[f32], data_be: &[u8]) -> f32 {
-        let num_blk = data_be.len() / 8;
-        let mut data_ptr = data_be.as_ptr() as *const u64;
-        let mut query_ptr = query.as_ptr();
-        let mut sum = _mm512_setzero_ps();
-        for _ in 0..num_blk {
-            let bits = (*data_ptr).reverse_bits();
-            data_ptr = data_ptr.add(1);
-            sum = _mm512_add_ps(sum, _mm512_maskz_loadu_ps(bits as u16, query_ptr));
-            sum = _mm512_add_ps(
-                sum,
-                _mm512_maskz_loadu_ps((bits >> 16) as u16, query_ptr.add(16)),
-            );
-            sum = _mm512_add_ps(
-                sum,
-                _mm512_maskz_loadu_ps((bits >> 32) as u16, query_ptr.add(32)),
-            );
-            sum = _mm512_add_ps(
-                sum,
-                _mm512_maskz_loadu_ps((bits >> 48) as u16, query_ptr.add(48)),
-            );
-            query_ptr = query_ptr.add(64);
-        }
-        _mm512_reduce_add_ps(sum)
-    }
-}
-
-/// Symmetric scalars. Not the asymmetric `F_add` / `F_scale` / `F_error` fields.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Per-row factors of the symmetric estimator, stored in the `__sym_*`
+/// columns. They are not the asymmetric `__add_factors` / `__scale_factors`.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct SymFactors {
+    /// `‖r‖` of the rotated residual `r`.
     pub rho: f32,
+    /// `⟨r, ũ⟩ / (‖r‖ ‖ũ‖)` for the centered code `ũ`.
     pub gamma: f32,
+    /// `‖ũ‖`.
     pub unorm: f32,
+    /// `⟨r, c⟩ + ‖c‖² / 2` for the rotated centroid `c`; only Dot reads it.
     pub ip_cent: f32,
 }
 
-fn le_u64_at(bytes: &[u8], offset: usize) -> u64 {
-    debug_assert!(bytes.len() >= offset + 8);
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("8-byte little-endian word"),
-    )
+/// Accumulates the [`SymFactors`] of one row while it is quantized.
+pub struct SymFactorsBuilder<'a> {
+    centroid: &'a [f32],
+    centroid_norm_sq: f32,
+    ex_bits: u8,
+    code_bias: f32,
+    rho_sq: f32,
+    unorm_sq: f32,
+    ip: f32,
+    ip_cent: f32,
 }
 
-fn bin_word(bin_be: &[u8], dim: usize) -> u64 {
-    le_u64_at(bin_be, (dim / 64) * 8)
-}
+impl<'a> SymFactorsBuilder<'a> {
+    pub(crate) fn new(centroid: &'a [f32], centroid_norm_sq: f32, num_bits: u8) -> Self {
+        Self {
+            centroid,
+            centroid_norm_sq,
+            ex_bits: num_bits - 1,
+            code_bias: code_bias(num_bits),
+            rho_sq: 0.0,
+            unorm_sq: 0.0,
+            ip: 0.0,
+            ip_cent: 0.0,
+        }
+    }
 
-fn split_sign_bit(bin_be: &[u8], dim: usize) -> u32 {
-    let word = bin_word(bin_be, dim);
-    ((word >> (63 - (dim % 64))) & 1) as u32
-}
+    /// Adds dimension `dim`: its rotated residual and the sign bit and ex code
+    /// it was quantized to.
+    pub(crate) fn observe(&mut self, dim: usize, residual: f32, sign: u8, ex_code: u8) {
+        let code = ((sign as u32) << self.ex_bits) + ex_code as u32;
+        let centered = code as f32 - self.code_bias;
+        self.rho_sq += residual * residual;
+        self.unorm_sq += centered * centered;
+        self.ip += residual * centered;
+        self.ip_cent += residual * self.centroid[dim];
+    }
 
-fn split_ex_code(ex: &[u8], dim: usize, ex_bits: u8) -> u32 {
-    match ex_bits {
-        0 => 0,
-        1..=8 => crate::vector::bq::ex_dot::blocked_ex_code_value(ex, dim, ex_bits) as u32,
-        _ => unreachable!("ex_bits must be in 0..=8"),
+    pub(crate) fn finish(self) -> SymFactors {
+        let rho = self.rho_sq.sqrt();
+        let unorm = self.unorm_sq.sqrt();
+        let ip_cent = self.ip_cent + 0.5 * self.centroid_norm_sq;
+        // A zero residual has no direction; `sym_dist` never reads its code.
+        if rho == 0.0 {
+            return SymFactors {
+                rho,
+                gamma: 1.0,
+                unorm: 1.0,
+                ip_cent,
+            };
+        }
+        SymFactors {
+            rho,
+            gamma: self.ip / (rho * unorm),
+            unorm,
+            ip_cent,
+        }
     }
 }
 
-fn split_total_code(bin_be: &[u8], ex: &[u8], dim: usize, num_bits: u8) -> u32 {
-    let ex_bits = num_bits.saturating_sub(1);
-    split_ex_code(ex, dim, ex_bits) + (split_sign_bit(bin_be, dim) << ex_bits)
+/// One row as [`sym_dist`] reads it: sign words, blocked ex codes, factors.
+#[derive(Debug, Clone, Copy)]
+pub struct SymCode<'a> {
+    pub signs: &'a [u8],
+    pub ex: &'a [u8],
+    pub factors: SymFactors,
+}
+
+fn split_sign_bit(signs: &[u8], dim: usize) -> u32 {
+    let offset = (dim / 64) * 8;
+    let word = u64::from_le_bytes(
+        signs[offset..offset + 8]
+            .try_into()
+            .expect("8-byte sign word"),
+    );
+    ((word >> (63 - (dim % 64))) & 1) as u32
+}
+
+fn split_total_code(signs: &[u8], ex: &[u8], dim: usize, num_bits: u8) -> u32 {
+    let ex_bits = num_bits - 1;
+    let ex_code = if ex_bits == 0 {
+        0
+    } else {
+        crate::vector::bq::ex_dot::blocked_ex_code_value(ex, dim, ex_bits) as u32
+    };
+    ex_code + (split_sign_bit(signs, dim) << ex_bits)
 }
 
 fn code_bias(num_bits: u8) -> f32 {
     ((1u32 << num_bits) - 1) as f32 / 2.0
 }
 
-/// ρ, γ, ‖ũ‖, and ip_cent from a rotated residual, its centroid, and codes.
-pub fn compute_sym_factors(
-    residual: &[f32],
-    centroid: &[f32],
-    bin_be: &[u8],
-    blocked_ex: &[u8],
-    num_bits: u8,
-) -> SymFactors {
-    debug_assert_eq!(residual.len(), centroid.len());
-    let dim = residual.len();
-    let cb = code_bias(num_bits);
-    let mut rho_sq = 0.0f32;
-    let mut unorm_sq = 0.0f32;
-    let mut ip = 0.0f32;
-    let mut ip_cent = 0.0f32;
-    let mut c_norm2 = 0.0f32;
-    for i in 0..dim {
-        let centered = split_total_code(bin_be, blocked_ex, i, num_bits) as f32 - cb;
-        rho_sq += residual[i] * residual[i];
-        unorm_sq += centered * centered;
-        ip += residual[i] * centered;
-        ip_cent += residual[i] * centroid[i];
-        c_norm2 += centroid[i] * centroid[i];
-    }
-    ip_cent += 0.5 * c_norm2;
-    let rho = rho_sq.sqrt();
-    let unorm = unorm_sq.sqrt();
-    if rho == 0.0 || unorm == 0.0 {
-        return SymFactors {
-            rho,
-            gamma: 1.0,
-            unorm: 1.0,
-            ip_cent,
-        };
-    }
-    SymFactors {
-        rho,
-        gamma: ip / (rho * unorm),
-        unorm,
-        ip_cent,
-    }
-}
-
-/// Encode-path factors from unpacked extra codes. Same `r > 0` sign as
-/// [`pack_binary_be`]; does not unpack blocked extra.
-#[cfg(test)]
-pub(crate) fn compute_sym_factors_from_values(
-    residual: &[f32],
-    centroid: &[f32],
-    ex_values: &[u8],
-    centroid_norm_sq: f32,
-    num_bits: u8,
-) -> SymFactors {
-    debug_assert_eq!(residual.len(), centroid.len());
-    let dim = residual.len();
-    let ex_bits = num_bits.saturating_sub(1);
-    // 1-bit rows carry no ex codes; the slice may be empty then.
-    debug_assert!(ex_values.len() == dim || (ex_bits == 0 && ex_values.is_empty()));
-    let cb = code_bias(num_bits);
-    let mut residual_norm_sq = 0.0f32;
-    let mut unorm_sq = 0.0f32;
-    let mut ip = 0.0f32;
-    let mut ip_cent = 0.0f32;
-    for i in 0..dim {
-        let sign = u32::from(residual[i] > 0.0);
-        let ex = if ex_bits == 0 {
-            0
-        } else {
-            u32::from(ex_values[i])
-        };
-        let centered = ((sign << ex_bits) + ex) as f32 - cb;
-        residual_norm_sq += residual[i] * residual[i];
-        unorm_sq += centered * centered;
-        ip += residual[i] * centered;
-        ip_cent += residual[i] * centroid[i];
-    }
-    ip_cent += 0.5 * centroid_norm_sq;
-    let rho = residual_norm_sq.sqrt();
-    let unorm = unorm_sq.sqrt();
-    if rho == 0.0 || unorm == 0.0 {
-        return SymFactors {
-            rho,
-            gamma: 1.0,
-            unorm: 1.0,
-            ip_cent,
-        };
-    }
-    SymFactors {
-        rho,
-        gamma: ip / (rho * unorm),
-        unorm,
-        ip_cent,
-    }
-}
-
 type CenteredIpFn = fn(&[u8], &[u8], &[u8], &[u8], usize, u8) -> f32;
 
-fn select_centered_ip() -> CenteredIpFn {
+static CENTERED_IP: LazyLock<CenteredIpFn> = LazyLock::new(|| {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            return x86::centered_code_ip_dispatch;
+            return x86::centered_code_ip;
         }
     }
     centered_code_ip_scalar
-}
+});
 
-static CENTERED_IP: LazyLock<CenteredIpFn> = LazyLock::new(select_centered_ip);
-
-fn finish_centered(ip_uu: i32, sum_a: i32, sum_b: i32, dim: usize, cb: f32) -> f32 {
+/// `Σ (ua - cb)(ub - cb)` from `Σ ua ub` and the code sums. `i64` keeps
+/// 9-bit codes of high-dimensional vectors from overflowing.
+fn finish_centered(ip_uu: i64, sum_a: i64, sum_b: i64, dim: usize, cb: f32) -> f32 {
     let center = cb as f64;
     ((ip_uu as f64) - (center * (sum_a + sum_b) as f64) + (dim as f64 * center * center)) as f32
 }
 
 fn centered_code_ip_scalar(
-    bin_a: &[u8],
+    signs_a: &[u8],
     ex_a: &[u8],
-    bin_b: &[u8],
+    signs_b: &[u8],
     ex_b: &[u8],
     dim: usize,
     num_bits: u8,
 ) -> f32 {
     if num_bits == 5 && dim.is_multiple_of(64) {
-        return centered_code_ip_scalar_4ex(bin_a, ex_a, bin_b, ex_b, dim);
+        return centered_code_ip_scalar_4ex(signs_a, ex_a, signs_b, ex_b, dim);
     }
-    let cb = code_bias(num_bits);
-    let mut ip_uu: i32 = 0;
-    let mut sum_a: i32 = 0;
-    let mut sum_b: i32 = 0;
+    let mut ip_uu = 0i64;
+    let mut sum_a = 0i64;
+    let mut sum_b = 0i64;
     for i in 0..dim {
-        let ua = split_total_code(bin_a, ex_a, i, num_bits) as i32;
-        let ub = split_total_code(bin_b, ex_b, i, num_bits) as i32;
+        let ua = split_total_code(signs_a, ex_a, i, num_bits) as i64;
+        let ub = split_total_code(signs_b, ex_b, i, num_bits) as i64;
         ip_uu += ua * ub;
         sum_a += ua;
         sum_b += ub;
     }
-    finish_centered(ip_uu, sum_a, sum_b, dim, cb)
+    finish_centered(ip_uu, sum_a, sum_b, dim, code_bias(num_bits))
 }
 
 fn centered_code_ip_scalar_4ex(
-    bin_a: &[u8],
+    signs_a: &[u8],
     ex_a: &[u8],
-    bin_b: &[u8],
+    signs_b: &[u8],
     ex_b: &[u8],
     dim: usize,
 ) -> f32 {
-    let mut ip_uu: i32 = 0;
-    let mut sum_a: i32 = 0;
-    let mut sum_b: i32 = 0;
-    let words = dim / 64;
-    for w in 0..words {
-        let sa = le_u64_at(bin_a, w * 8);
-        let sb = le_u64_at(bin_b, w * 8);
+    let mut ip_uu = 0i64;
+    let mut sum_a = 0i64;
+    let mut sum_b = 0i64;
+    for w in 0..dim / 64 {
+        let word = |signs: &[u8]| {
+            u64::from_le_bytes(
+                signs[w * 8..w * 8 + 8]
+                    .try_into()
+                    .expect("8-byte sign word"),
+            )
+        };
+        let (sa, sb) = (word(signs_a), word(signs_b));
         let pa = &ex_a[w * 32..w * 32 + 32];
         let pb = &ex_b[w * 32..w * 32 + 32];
         for g in 0..4 {
@@ -370,85 +228,70 @@ fn centered_code_ip_scalar_4ex(
                 let ub0 = (gb[i] as u32 & 0x0f) + (t0 << 4);
                 let ua1 = (ga[i] as u32 >> 4) + (s1 << 4);
                 let ub1 = (gb[i] as u32 >> 4) + (t1 << 4);
-                ip_uu += (ua0 * ub0 + ua1 * ub1) as i32;
-                sum_a += (ua0 + ua1) as i32;
-                sum_b += (ub0 + ub1) as i32;
+                ip_uu += (ua0 * ub0 + ua1 * ub1) as i64;
+                sum_a += (ua0 + ua1) as i64;
+                sum_b += (ub0 + ub1) as i64;
             }
         }
     }
     finish_centered(ip_uu, sum_a, sum_b, dim, 15.5)
 }
 
-/// ⟨ũ, ṽ⟩ after centering codes at `((1 << bits) - 1) / 2`.
-pub(crate) fn centered_code_ip(
-    bin_a: &[u8],
-    ex_a: &[u8],
-    bin_b: &[u8],
-    ex_b: &[u8],
-    dim: usize,
-    num_bits: u8,
-) -> f32 {
-    debug_assert_eq!(bin_a.len(), sym_bin_code_bytes(dim));
-    debug_assert_eq!(bin_b.len(), sym_bin_code_bytes(dim));
-    if num_bits > 1 {
-        let ex_len = crate::vector::bq::ex_dot::blocked_ex_code_bytes(dim, num_bits - 1);
-        debug_assert_eq!(ex_a.len(), ex_len);
-        debug_assert_eq!(ex_b.len(), ex_len);
-    }
-    CENTERED_IP(bin_a, ex_a, bin_b, ex_b, dim, num_bits)
+/// `⟨ũa, ũb⟩` of two codes centered at `((1 << num_bits) - 1) / 2`.
+fn centered_code_ip(a: &SymCode, b: &SymCode, dim: usize, num_bits: u8) -> f32 {
+    debug_assert_eq!(a.signs.len(), sign_word_bytes(dim));
+    debug_assert_eq!(b.signs.len(), sign_word_bytes(dim));
+    debug_assert!(
+        num_bits == 1
+            || a.ex.len() == crate::vector::bq::ex_dot::blocked_ex_code_bytes(dim, num_bits - 1)
+    );
+    CENTERED_IP(a.signs, a.ex, b.signs, b.ex, dim, num_bits)
 }
 
-/// Lib `sym_dist_split` estimator. L2 and Dot only.
-#[allow(clippy::too_many_arguments)]
+/// Lib `sym_dist_split`: the L2 or Dot distance between two rows of the same
+/// partition, estimated from their codes alone. Any metric other than Dot is
+/// scored as L2, the metric a normalized Cosine index stores.
 pub fn sym_dist(
-    a: &SymFactors,
-    bin_a: &[u8],
-    ex_a: &[u8],
-    b: &SymFactors,
-    bin_b: &[u8],
-    ex_b: &[u8],
+    a: &SymCode,
+    b: &SymCode,
     dim: usize,
     num_bits: u8,
-    distance_type: lance_linalg::distance::DistanceType,
+    distance_type: DistanceType,
 ) -> f32 {
-    if a.rho == 0.0 && b.rho == 0.0 {
+    let (fa, fb) = (&a.factors, &b.factors);
+    if fa.rho == 0.0 && fb.rho == 0.0 {
         return match distance_type {
-            lance_linalg::distance::DistanceType::Dot => 1.0 - (a.ip_cent + b.ip_cent),
-            lance_linalg::distance::DistanceType::L2 => 0.0,
-            _ => unreachable!("SymRaBitQ only supports L2 and Dot"),
+            DistanceType::Dot => 1.0 - (fa.ip_cent + fb.ip_cent),
+            _ => 0.0,
         };
     }
-    let ip_u = centered_code_ip(bin_a, ex_a, bin_b, ex_b, dim, num_bits);
-    let ip_bar = ip_u / (a.unorm * b.unorm);
-    let hat = ip_bar / (a.gamma * b.gamma);
+    // Keep Lib's operation order: the L2 terms cancel for close rows, so a
+    // reordering shows up in the result.
+    let ip_bar = centered_code_ip(a, b, dim, num_bits) / (fa.unorm * fb.unorm);
+    let hat = ip_bar / (fa.gamma * fb.gamma);
     match distance_type {
-        lance_linalg::distance::DistanceType::Dot => {
-            1.0 - (a.ip_cent + b.ip_cent + (a.rho * b.rho * hat))
-        }
-        lance_linalg::distance::DistanceType::L2 => {
-            (a.rho * a.rho) + (b.rho * b.rho) - (2.0 * a.rho * b.rho * hat)
-        }
-        _ => unreachable!("SymRaBitQ only supports L2 and Dot"),
+        DistanceType::Dot => 1.0 - (fa.ip_cent + fb.ip_cent + fa.rho * fb.rho * hat),
+        _ => fa.rho * fa.rho + fb.rho * fb.rho - 2.0 * fa.rho * fb.rho * hat,
     }
 }
 
 /// Lib `SplitSingleQuery::kNumBits`. Query is 4-bit; data stays 1-bit.
-pub(crate) const QUERY_WARMUP_BITS: u8 = 4;
+pub const QUERY_WARMUP_BITS: u8 = 4;
 const _: () = assert!(QUERY_WARMUP_BITS == 4);
 
 /// `dim` rounded up to a 64-dim word, matching Lib `padded_dim`.
-pub(crate) fn padded_code_dim(dim: usize) -> usize {
+pub fn padded_code_dim(dim: usize) -> usize {
     dim.div_ceil(64) * 64
 }
 
 /// `u64` words in a transposed 4-bit query: one word per 64 dims per bitplane.
-pub(crate) fn query_plane_words(dim: usize) -> usize {
+fn query_plane_words(dim: usize) -> usize {
     (padded_code_dim(dim) / 64) * QUERY_WARMUP_BITS as usize
 }
 
 /// 4-bit reconstruction codes plus `delta` / `vl` from Lib `quantize_scalar`.
 #[derive(Debug, Clone)]
-pub(crate) struct ScalarCode {
+pub struct ScalarCode {
     pub codes: Vec<u8>,
     pub delta: f32,
     pub vl: f32,
@@ -476,7 +319,7 @@ const TIGHT_START_3EX: f64 = 0.52;
 /// `get_const_scaling_factors(padded_dim, 3)` used by `faster_config(dim, 4)`.
 ///
 /// Sampling this is expensive, so callers resolve it once per index rather
-/// than once per query. See [`CachedSymPair::t_const`].
+/// than once per query.
 pub fn const_scaling_factor_3ex(padded_dim: usize) -> f64 {
     if padded_dim == 0 {
         return 0.0;
@@ -572,7 +415,7 @@ fn best_rescale_factor_3ex(o_abs: &[f64]) -> f64 {
 }
 
 /// Lib `quantize_scalar` with `RECONSTRUCTION` and a precomputed `t_const`.
-pub(crate) fn quantize_scalar_reconstruct(query: &[f32], t_const: f64) -> ScalarCode {
+fn quantize_scalar_reconstruct(query: &[f32], t_const: f64) -> ScalarCode {
     let dim = padded_code_dim(query.len());
     let mut residual = vec![0.0f32; dim];
     residual[..query.len()].copy_from_slice(query);
@@ -634,7 +477,7 @@ const WARMUP_SUPER_CHUNKS: usize = 8;
 
 /// Lib `new_transpose_bin_512`: dim0 at bit 63; each 512-dim superblock is
 /// plane-major (`tq[j * nchunk + k]`).
-pub(crate) fn transpose_query_bin_be(codes: &[u8], out: &mut [u64]) {
+fn transpose_query_bin_be(codes: &[u8], out: &mut [u64]) {
     debug_assert_eq!(out.len(), query_plane_words(codes.len()));
     out.fill(0);
     let bits = QUERY_WARMUP_BITS as usize;
@@ -664,7 +507,7 @@ pub(crate) fn transpose_query_bin_be(codes: &[u8], out: &mut [u64]) {
 }
 
 /// Lib scalar `warmup_ip_x0_q` layout: `[block0 planes 0..3, block1 planes 0..3, ...]`.
-pub(crate) fn transpose_query_bin_block_major(codes: &[u8], out: &mut [u64]) {
+fn transpose_query_bin_block_major(codes: &[u8], out: &mut [u64]) {
     debug_assert_eq!(out.len(), query_plane_words(codes.len()));
     out.fill(0);
     let bits = QUERY_WARMUP_BITS as usize;
@@ -748,14 +591,9 @@ fn warmup_ip_accumulate_scalar(data_be: &[u8], query_planes: &[u64]) -> (u64, u6
     (ip, ppc)
 }
 
-/// Lib scalar `warmup_ip_x0_q` (always scalar; for tests / benches).
+/// Lib scalar `warmup_ip_x0_q`.
 #[inline(always)]
-pub(crate) fn warmup_ip_x0_q_scalar(
-    data_be: &[u8],
-    query_planes: &[u64],
-    delta: f32,
-    vl: f32,
-) -> f32 {
+fn warmup_ip_x0_q_scalar(data_be: &[u8], query_planes: &[u64], delta: f32, vl: f32) -> f32 {
     debug_assert!(data_be.len().is_multiple_of(8));
     debug_assert_eq!(
         query_planes.len(),
@@ -1199,9 +1037,9 @@ mod x86 {
             );
         }
         super::finish_centered(
-            hsum_epi32_128(ip),
-            hsum_sad_128(sum_a),
-            hsum_sad_128(sum_b),
+            hsum_epi32_128(ip) as i64,
+            hsum_sad_128(sum_a) as i64,
+            hsum_sad_128(sum_b) as i64,
             dim,
             3.5,
         )
@@ -1236,9 +1074,9 @@ mod x86 {
             );
         }
         super::finish_centered(
-            hsum_epi32_128(ip),
-            hsum_sad_128(sum_a),
-            hsum_sad_128(sum_b),
+            hsum_epi32_128(ip) as i64,
+            hsum_sad_128(sum_a) as i64,
+            hsum_sad_128(sum_b) as i64,
             dim,
             15.5,
         )
@@ -1386,11 +1224,11 @@ mod x86 {
             n_sb += sb.count_ones() as i32;
             n_and += (sa & sb).count_ones() as i32;
         }
-        let ip_uu = hsum_epi32_128(ip_xy)
-            + (256 * (hsum_sad_128(sum_sa_xb) + hsum_sad_128(sum_sb_xa)))
-            + (65536 * n_and);
-        let sum_a = hsum_sad_128(sum_x) + (256 * n_sa);
-        let sum_b = hsum_sad_128(sum_y) + (256 * n_sb);
+        let ip_uu = hsum_epi32_128(ip_xy) as i64
+            + 256 * (hsum_sad_128(sum_sa_xb) + hsum_sad_128(sum_sb_xa)) as i64
+            + 65536 * n_and as i64;
+        let sum_a = hsum_sad_128(sum_x) as i64 + 256 * n_sa as i64;
+        let sum_b = hsum_sad_128(sum_y) as i64 + 256 * n_sb as i64;
         super::finish_centered(ip_uu, sum_a, sum_b, dim, 255.5)
     }
 
@@ -1482,10 +1320,8 @@ mod x86 {
     /// Lib `unpack_ex_64`: decode one 64-dim block of blocked-layout extra
     /// codes into four 16-byte groups (`out[g]` = dims `16g..16g+15`).
     ///
-    /// `ex` must point to a full 64-dim block of `8 * ex_bits` bytes. Arms
-    /// 2/4/8 are never reached by the current dispatch (total bits 3/5/9 use
-    /// the specialized kernels); they are kept for parity with the lib's
-    /// generic kernel.
+    /// `ex` must point to a full 64-dim block of `8 * ex_bits` bytes. Total
+    /// widths 3, 5 and 9 have dedicated kernels and never get here.
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn unpack_ex_64(ex: *const u8, ex_bits: u8, out: &mut [__m128i; 4]) {
@@ -1499,20 +1335,12 @@ mod x86 {
                     *slot = extra_1bit_16((ex.add(group * 2) as *const u16).read_unaligned());
                 }
             }
-            2 => unpack_2bit_fields(ex, out),
             3 => {
                 unpack_2bit_fields(ex, out);
                 // SAFETY: 24-byte block; reads the top-bit plane (bytes 16..24).
                 let top = (ex.add(16) as *const u64).read_unaligned();
                 for (group, slot) in out.iter_mut().enumerate() {
                     *slot = _mm_or_si128(*slot, top_bits_group(top, 2, group as u32));
-                }
-            }
-            4 => {
-                for (group, slot) in out.iter_mut().enumerate() {
-                    // SAFETY: 32-byte block; each group reads 8 bytes.
-                    let raw = _mm_loadl_epi64(ex.add(group * 8) as *const __m128i);
-                    *slot = unpack_4bit_xmm(raw);
                 }
             }
             5 => {
@@ -1538,13 +1366,7 @@ mod x86 {
                     *slot = _mm_or_si128(*slot, top_bits_group(top, 6, group as u32));
                 }
             }
-            8 => {
-                for (group, slot) in out.iter_mut().enumerate() {
-                    // SAFETY: 64-byte block; each group reads 16 bytes.
-                    *slot = _mm_loadu_si128(ex.add(group * 16) as *const __m128i);
-                }
-            }
-            _ => unreachable!("ex_bits must be in 0..=8"),
+            _ => unreachable!("ex_bits {ex_bits} has a dedicated kernel"),
         }
     }
 
@@ -1634,56 +1456,33 @@ mod x86 {
             }
         }
         super::finish_centered(
-            hsum_epi32_128(ip),
-            hsum_sad_128(sum_a),
-            hsum_sad_128(sum_b),
+            hsum_epi32_128(ip) as i64,
+            hsum_sad_128(sum_a) as i64,
+            hsum_sad_128(sum_b) as i64,
             dim,
             super::code_bias(num_bits),
         )
     }
 
-    #[target_feature(enable = "avx2")]
-    unsafe fn centered_code_ip_avx2(
-        bin_a: &[u8],
+    /// AVX2 [`super::centered_code_ip`]. Both rows are zero-padded to whole
+    /// 64-dim blocks, so the kernels iterate every padded block: zero codes
+    /// add nothing, and `finish_centered` centers with the true `dim`.
+    pub(super) fn centered_code_ip(
+        signs_a: &[u8],
         ex_a: &[u8],
-        bin_b: &[u8],
+        signs_b: &[u8],
         ex_b: &[u8],
         dim: usize,
         num_bits: u8,
     ) -> f32 {
-        match num_bits {
-            3 => centered_code_ip_2bit(bin_a, ex_a, bin_b, ex_b, dim),
-            5 => centered_code_ip_4bit(bin_a, ex_a, bin_b, ex_b, dim),
-            9 => centered_code_ip_8bit(bin_a, ex_a, bin_b, ex_b, dim),
-            1..=8 => centered_code_ip_fitted(bin_a, ex_a, bin_b, ex_b, dim, num_bits),
-            _ => super::centered_code_ip_scalar(bin_a, ex_a, bin_b, ex_b, dim, num_bits),
-        }
-    }
-
-    pub(super) fn centered_code_ip_dispatch(
-        bin_a: &[u8],
-        ex_a: &[u8],
-        bin_b: &[u8],
-        ex_b: &[u8],
-        dim: usize,
-        num_bits: u8,
-    ) -> f32 {
-        if matches!(num_bits, 1..=9) {
-            debug_assert_eq!(bin_a.len(), super::sym_bin_code_bytes(dim));
-            debug_assert_eq!(bin_b.len(), super::sym_bin_code_bytes(dim));
-            if num_bits > 1 {
-                let ex_len = crate::vector::bq::ex_dot::blocked_ex_code_bytes(dim, num_bits - 1);
-                debug_assert_eq!(ex_a.len(), ex_len);
-                debug_assert_eq!(ex_b.len(), ex_len);
+        // SAFETY: `CENTERED_IP` selects this function only when AVX2 is present.
+        unsafe {
+            match num_bits {
+                3 => centered_code_ip_2bit(signs_a, ex_a, signs_b, ex_b, dim),
+                5 => centered_code_ip_4bit(signs_a, ex_a, signs_b, ex_b, dim),
+                9 => centered_code_ip_8bit(signs_a, ex_a, signs_b, ex_b, dim),
+                _ => centered_code_ip_fitted(signs_a, ex_a, signs_b, ex_b, dim, num_bits),
             }
-            // SAFETY: AVX2 was selected in `select_centered_ip`. Both buffers
-            // are zero-padded to whole 64-dim blocks (`sym_bin_code_bytes` /
-            // `blocked_ex_code_bytes`), so the kernels may iterate every padded
-            // block: zero tail codes add nothing to ip/sum accumulators, and
-            // `finish_centered` still centers with the true `dim`.
-            unsafe { centered_code_ip_avx2(bin_a, ex_a, bin_b, ex_b, dim, num_bits) }
-        } else {
-            super::centered_code_ip_scalar(bin_a, ex_a, bin_b, ex_b, dim, num_bits)
         }
     }
 }
@@ -1692,76 +1491,27 @@ mod x86 {
 mod tests {
     use std::collections::HashMap;
 
-    use lance_linalg::distance::DistanceType;
-    use serde::Deserialize;
-
-    use crate::vector::bq::ex_dot::{blocked_ex_code_bytes, pack_blocked_row};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use serde::Deserialize;
 
-    use super::{
-        QUERY_WARMUP_BITS, ResidualWarmupQuery, SymFactors, centered_code_ip_scalar,
-        compute_sym_factors, compute_sym_factors_from_values, const_scaling_factor_3ex,
-        mask_ip_x0_q, mask_ip_x0_q_scalar, pack_binary_be, pack_binary_be_from_le, padded_code_dim,
-        prepare_residual_warmup_query, quantize_scalar_reconstruct, query_plane_words,
-        sym_bin_code_bytes, sym_dist, transpose_query_bin_be, transpose_query_bin_block_major,
-        warmup_ip_x0_q, warmup_ip_x0_q_scalar,
+    use super::*;
+    use crate::vector::bq::ex_dot::{
+        blocked_ex_code_bytes, blocked_ex_code_value, pack_blocked_row,
     };
 
+    /// Lib outputs: per-vector factors and pairwise `sym_dist`, with f32
+    /// values as hex IEEE-754 bit patterns.
     const SYM_DIST_GOLDEN: &str = include_str!("../../../testdata/symrabitq/sym_dist.json");
 
-    fn f32_from_bits_hex(hex: &str) -> f32 {
-        let bits = u32::from_str_radix(hex, 16).expect("f32 bits hex");
-        f32::from_bits(bits)
+    #[derive(Deserialize)]
+    struct Golden {
+        vectors: Vec<GoldenVector>,
+        pairs: Vec<GoldenPair>,
     }
 
-    fn to_hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    #[test]
-    fn mask_ip_x0_q_matches_positive_residual_dot() {
-        let dim = 960usize;
-        let mut rng = StdRng::seed_from_u64(20260915);
-        let residual: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.5f32..1.5)).collect();
-        let query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect();
-        let mut bin = vec![0u8; sym_bin_code_bytes(dim)];
-        pack_binary_be(&residual, &mut bin);
-        let want: f32 = residual
-            .iter()
-            .zip(query.iter())
-            .map(|(&r, &q)| if r > 0.0 { q } else { 0.0 })
-            .sum();
-        let dispatch = mask_ip_x0_q(&query, &bin);
-        let scalar = mask_ip_x0_q_scalar(&query, &bin);
-        assert!(
-            (dispatch - want).abs() <= 1e-4 * want.abs().max(1.0),
-            "dispatch={dispatch} want={want}"
-        );
-        assert!(
-            (scalar - want).abs() <= 1e-4 * want.abs().max(1.0),
-            "scalar={scalar} want={want}"
-        );
-
-        let mut le = vec![0u8; dim.div_ceil(8)];
-        for (dim_idx, &value) in residual.iter().enumerate() {
-            if value > 0.0 {
-                le[dim_idx / 8] |= 1u8 << (dim_idx % 8);
-            }
-        }
-        let mut from_le = vec![0u8; bin.len()];
-        pack_binary_be_from_le(&le, dim, &mut from_le);
-        assert_eq!(from_le, bin);
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct DistGoldenFile {
-        vectors: Vec<DistVector>,
-        pairs: Vec<DistPair>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct DistVector {
+    #[derive(Deserialize)]
+    struct GoldenVector {
         id: String,
         metric: String,
         num_bits: u8,
@@ -1776,470 +1526,211 @@ mod tests {
         ip_cent: String,
     }
 
-    #[derive(Debug, Deserialize)]
-    struct DistPair {
+    #[derive(Deserialize)]
+    struct GoldenPair {
         a: String,
         b: String,
         sym_dist: String,
     }
 
-    fn from_hex(hex: &str) -> Vec<u8> {
-        assert_eq!(hex.len() % 2, 0, "odd hex length");
+    impl GoldenVector {
+        fn factors(&self) -> SymFactors {
+            SymFactors {
+                rho: f32_from_hex(&self.rho),
+                gamma: f32_from_hex(&self.gamma),
+                unorm: f32_from_hex(&self.unorm),
+                ip_cent: f32_from_hex(&self.ip_cent),
+            }
+        }
+
+        fn distance_type(&self) -> DistanceType {
+            match self.metric.as_str() {
+                "l2" => DistanceType::L2,
+                "dot" => DistanceType::Dot,
+                other => panic!("unsupported golden metric {other}"),
+            }
+        }
+    }
+
+    fn golden() -> Golden {
+        serde_json::from_str(SYM_DIST_GOLDEN).unwrap()
+    }
+
+    fn bytes_from_hex(hex: &str) -> Vec<u8> {
         (0..hex.len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect()
     }
 
-    /// Golden f32 arrays are stored as concatenated IEEE-754 bit patterns,
-    /// 8 hex chars per value.
-    fn load_f32_hex(hex: &str) -> Vec<f32> {
-        assert_eq!(hex.len() % 8, 0, "f32 hex length");
+    fn f32_from_hex(hex: &str) -> f32 {
+        f32::from_bits(u32::from_str_radix(hex, 16).unwrap())
+    }
+
+    fn f32s_from_hex(hex: &str) -> Vec<f32> {
         (0..hex.len())
             .step_by(8)
-            .map(|i| f32_from_bits_hex(&hex[i..i + 8]))
+            .map(|i| f32_from_hex(&hex[i..i + 8]))
             .collect()
     }
 
-    fn rel_close(got: f32, expected: f32, id: &str, field: &str) {
-        let scale = expected.abs().max(1.0);
-        let err = (got - expected).abs() / scale;
-        assert!(
-            err <= 1e-5,
-            "{id}.{field}: got {got} expected {expected} rel_err={err}"
-        );
-    }
-
-    fn metric_type(metric: &str) -> DistanceType {
-        match metric {
-            "l2" => DistanceType::L2,
-            "dot" => DistanceType::Dot,
-            other => panic!("unsupported golden metric {other}"),
-        }
-    }
-
-    fn load_dist_golden() -> DistGoldenFile {
-        serde_json::from_str(SYM_DIST_GOLDEN).expect("parse sym_dist.json")
+    fn assert_close(got: f32, expected: f32, context: &str) {
+        let err = (got - expected).abs() / expected.abs().max(1.0);
+        assert!(err <= 1e-5, "{context}: got {got}, expected {expected}");
     }
 
     #[test]
-    fn compute_sym_factors_matches_lib_golden() {
-        let golden = load_dist_golden();
-        let mut saw_l2 = false;
-        let mut saw_dot = false;
-        let mut saw_zero_rho = false;
-        for vec in &golden.vectors {
-            let residual = load_f32_hex(&vec.residual_hex);
-            let centroid = load_f32_hex(&vec.centroid_hex);
-            assert_eq!(residual.len(), vec.dim, "case {}", vec.id);
-            let bin = from_hex(&vec.bin_hex);
-            let ex = from_hex(&vec.ex_hex);
-
-            let mut packed = vec![0u8; sym_bin_code_bytes(vec.dim)];
-            pack_binary_be(&residual, &mut packed);
-            assert_eq!(to_hex(&packed), vec.bin_hex, "case {}", vec.id);
-
-            let got = compute_sym_factors(&residual, &centroid, &bin, &ex, vec.num_bits);
-            rel_close(got.rho, f32_from_bits_hex(&vec.rho), &vec.id, "rho");
-            rel_close(got.gamma, f32_from_bits_hex(&vec.gamma), &vec.id, "gamma");
-            rel_close(got.unorm, f32_from_bits_hex(&vec.unorm), &vec.id, "unorm");
-            rel_close(
-                got.ip_cent,
-                f32_from_bits_hex(&vec.ip_cent),
-                &vec.id,
-                "ip_cent",
-            );
-            saw_l2 |= vec.metric == "l2";
-            saw_dot |= vec.metric == "dot";
-            saw_zero_rho |= got.rho == 0.0;
-        }
-        assert!(saw_l2 && saw_dot && saw_zero_rho);
-    }
-
-    #[test]
-    fn compute_sym_factors_from_values_matches_packed() {
-        use crate::vector::bq::ex_dot::{blocked_ex_code_bytes, pack_blocked_row};
-
-        let mut rng = StdRng::seed_from_u64(20260915);
-        for dim in [8usize, 64, 96] {
-            for num_bits in [2u8, 5, 8] {
-                let ex_bits = num_bits - 1;
-                let max_ex = (1u16 << ex_bits) - 1;
-                let mut residual = vec![0.0f32; dim];
-                let mut centroid = vec![0.0f32; dim];
-                let mut ex_values = vec![0u8; dim];
-                for i in 0..dim {
-                    residual[i] = rng.random_range(-2.0..2.0);
-                    centroid[i] = rng.random_range(-1.0..1.0);
-                    ex_values[i] = rng.random_range(0..=max_ex) as u8;
-                }
-                residual[0] = 0.0;
-                residual[1] = -0.0;
-                residual[2] = -1.5;
-                let centroid_norm_sq = centroid.iter().map(|v| v * v).sum::<f32>();
-                let mut bin = vec![0u8; super::sym_bin_code_bytes(dim)];
-                pack_binary_be(&residual, &mut bin);
-                let mut blocked = vec![0u8; blocked_ex_code_bytes(dim, ex_bits)];
-                pack_blocked_row(&ex_values, ex_bits, &mut blocked);
-                let packed = compute_sym_factors(&residual, &centroid, &bin, &blocked, num_bits);
-                let got = compute_sym_factors_from_values(
-                    &residual,
-                    &centroid,
-                    &ex_values,
-                    centroid_norm_sq,
-                    num_bits,
-                );
-                rel_close(got.rho, packed.rho, "from_values", "rho");
-                rel_close(got.gamma, packed.gamma, "from_values", "gamma");
-                rel_close(got.unorm, packed.unorm, "from_values", "unorm");
-                rel_close(got.ip_cent, packed.ip_cent, "from_values", "ip_cent");
+    fn test_sym_factors_match_lib() {
+        for vector in golden().vectors {
+            let residual = f32s_from_hex(&vector.residual_hex);
+            let centroid = f32s_from_hex(&vector.centroid_hex);
+            let signs = bytes_from_hex(&vector.bin_hex);
+            let ex = bytes_from_hex(&vector.ex_hex);
+            let centroid_norm_sq = centroid.iter().map(|value| value * value).sum();
+            let mut builder = SymFactorsBuilder::new(&centroid, centroid_norm_sq, vector.num_bits);
+            for (dim, &value) in residual.iter().enumerate() {
+                let ex_code = match vector.num_bits {
+                    1 => 0,
+                    num_bits => blocked_ex_code_value(&ex, dim, num_bits - 1),
+                };
+                builder.observe(dim, value, split_sign_bit(&signs, dim) as u8, ex_code);
+            }
+            let (got, want) = (builder.finish(), vector.factors());
+            for (name, got, want) in [
+                ("rho", got.rho, want.rho),
+                ("gamma", got.gamma, want.gamma),
+                ("unorm", got.unorm, want.unorm),
+                ("ip_cent", got.ip_cent, want.ip_cent),
+            ] {
+                assert_close(got, want, &format!("{}.{name}", vector.id));
             }
         }
-
-        let residual = vec![0.0f32; 8];
-        let centroid = vec![0.5f32; 8];
-        let ex_values = vec![1u8; 8];
-        let packed = {
-            let mut bin = vec![0u8; super::sym_bin_code_bytes(8)];
-            pack_binary_be(&residual, &mut bin);
-            let mut blocked = vec![0u8; blocked_ex_code_bytes(8, 1)];
-            pack_blocked_row(&ex_values, 1, &mut blocked);
-            compute_sym_factors(&residual, &centroid, &bin, &blocked, 2)
-        };
-        let got = compute_sym_factors_from_values(&residual, &centroid, &ex_values, 2.0, 2);
-        assert_eq!(got.gamma, 1.0);
-        assert_eq!(got.unorm, 1.0);
-        rel_close(got.rho, packed.rho, "zero_rho", "rho");
-        rel_close(got.ip_cent, packed.ip_cent, "zero_rho", "ip_cent");
     }
 
     #[test]
-    fn sym_dist_matches_lib_golden_pairs() {
-        let golden = load_dist_golden();
-        let by_id: HashMap<&str, &DistVector> = golden
+    fn test_sym_dist_matches_lib() {
+        let golden = golden();
+        let vectors: HashMap<_, _> = golden
             .vectors
             .iter()
-            .map(|vec| (vec.id.as_str(), vec))
+            .map(|vector| (vector.id.as_str(), vector))
             .collect();
-        assert!(!golden.pairs.is_empty());
         for pair in &golden.pairs {
-            let left = by_id[pair.a.as_str()];
-            let right = by_id[pair.b.as_str()];
-            assert_eq!(left.num_bits, right.num_bits);
-            assert_eq!(left.dim, right.dim);
-            assert_eq!(left.metric, right.metric);
-            let a = decode_vector(left);
-            let b = decode_vector(right);
+            let (a, b) = (vectors[pair.a.as_str()], vectors[pair.b.as_str()]);
+            let (signs_a, ex_a) = (bytes_from_hex(&a.bin_hex), bytes_from_hex(&a.ex_hex));
+            let (signs_b, ex_b) = (bytes_from_hex(&b.bin_hex), bytes_from_hex(&b.ex_hex));
             let got = sym_dist(
-                &a.factors,
-                &a.bin,
-                &a.ex,
-                &b.factors,
-                &b.bin,
-                &b.ex,
-                left.dim,
-                left.num_bits,
-                metric_type(&left.metric),
+                &SymCode {
+                    signs: &signs_a,
+                    ex: &ex_a,
+                    factors: a.factors(),
+                },
+                &SymCode {
+                    signs: &signs_b,
+                    ex: &ex_b,
+                    factors: b.factors(),
+                },
+                a.dim,
+                a.num_bits,
+                a.distance_type(),
             );
-            rel_close(
-                got,
-                f32_from_bits_hex(&pair.sym_dist),
-                &format!("{}-{}", pair.a, pair.b),
-                "sym_dist",
-            );
+            let context = format!("{}-{}", pair.a, pair.b);
+            assert_close(got, f32_from_hex(&pair.sym_dist), &context);
         }
     }
 
-    struct Decoded {
-        factors: SymFactors,
-        bin: Vec<u8>,
-        ex: Vec<u8>,
-    }
-
-    fn decode_vector(vec: &DistVector) -> Decoded {
-        let residual = load_f32_hex(&vec.residual_hex);
-        let centroid = load_f32_hex(&vec.centroid_hex);
-        let bin = from_hex(&vec.bin_hex);
-        let ex = from_hex(&vec.ex_hex);
-        let factors = compute_sym_factors(&residual, &centroid, &bin, &ex, vec.num_bits);
-        Decoded { factors, bin, ex }
+    /// Random codes in the production layout: sign words regrouped from
+    /// `_rabit_codes` bytes, ex codes packed with zero padding.
+    fn random_code(rng: &mut StdRng, dim: usize, num_bits: u8) -> (Vec<u8>, Vec<u8>) {
+        let codes: Vec<u8> = (0..dim / 8).map(|_| rng.random()).collect();
+        let signs = sign_words_from_codes(&codes, dim / 8);
+        if num_bits == 1 {
+            return (signs, Vec::new());
+        }
+        let ex_bits = num_bits - 1;
+        let max_code = ((1u16 << ex_bits) - 1) as u8;
+        let values: Vec<u8> = (0..dim).map(|_| rng.random_range(0..=max_code)).collect();
+        let mut ex = vec![0; blocked_ex_code_bytes(dim, ex_bits)];
+        pack_blocked_row(&values, ex_bits, &mut ex);
+        (signs, ex)
     }
 
     #[test]
-    fn simd_centered_ip_matches_scalar() {
+    fn test_centered_ip_simd_matches_scalar() {
         let mut rng = StdRng::seed_from_u64(20260914);
-        // 72/96/100/200 are not multiples of 64: they pin the zero-padded
-        // tail blocks the AVX2 kernels iterate over.
-        for dim in [8usize, 64, 72, 96, 100, 128, 200, 576, 960] {
+        // 72/104/200 end in a zero-padded 64-dim block the SIMD kernels read.
+        for dim in [8usize, 64, 72, 104, 128, 200, 576, 960] {
             for num_bits in 1u8..=9 {
-                let mut residual_a = vec![0.0f32; dim];
-                let mut residual_b = vec![0.0f32; dim];
-                for value in residual_a.iter_mut().chain(residual_b.iter_mut()) {
-                    *value = rng.random_range(-2.0..2.0);
-                }
-                let mut bin_a = vec![0u8; super::sym_bin_code_bytes(dim)];
-                let mut bin_b = vec![0u8; super::sym_bin_code_bytes(dim)];
-                super::pack_binary_be(&residual_a, &mut bin_a);
-                super::pack_binary_be(&residual_b, &mut bin_b);
-                let ex_len = if num_bits > 1 {
-                    blocked_ex_code_bytes(dim, num_bits - 1)
-                } else {
-                    0
-                };
-                // The kernels read every padded 64-dim block, so the ex codes
-                // must carry the production zero-padding invariant: random
-                // per-dim values packed with `pack_blocked_row`, not random
-                // bytes (whose padding tail would be nonzero garbage).
-                let random_ex = |rng: &mut StdRng| {
-                    if num_bits == 1 {
-                        return Vec::new();
-                    }
-                    let ex_bits = num_bits - 1;
-                    let max_ex = ((1u32 << ex_bits) - 1) as u8;
-                    let values = (0..dim)
-                        .map(|_| rng.random_range(0..=max_ex))
-                        .collect::<Vec<u8>>();
-                    let mut ex = vec![0u8; ex_len];
-                    pack_blocked_row(&values, ex_bits, &mut ex);
-                    ex
-                };
-                let ex_a = random_ex(&mut rng);
-                let ex_b = random_ex(&mut rng);
-                let simd = super::centered_code_ip(&bin_a, &ex_a, &bin_b, &ex_b, dim, num_bits);
-                let scalar = centered_code_ip_scalar(&bin_a, &ex_a, &bin_b, &ex_b, dim, num_bits);
-                let scale = scalar.abs().max(1.0);
-                assert!(
-                    (simd - scalar).abs() / scale <= 1e-5,
-                    "bits={num_bits} dim={dim} simd={simd} scalar={scalar}"
+                let (signs_a, ex_a) = random_code(&mut rng, dim, num_bits);
+                let (signs_b, ex_b) = random_code(&mut rng, dim, num_bits);
+                let dispatched = CENTERED_IP(&signs_a, &ex_a, &signs_b, &ex_b, dim, num_bits);
+                let scalar =
+                    centered_code_ip_scalar(&signs_a, &ex_a, &signs_b, &ex_b, dim, num_bits);
+                assert_close(
+                    dispatched,
+                    scalar,
+                    &format!("dim={dim} num_bits={num_bits}"),
                 );
             }
         }
     }
 
+    /// The warmup inner product of a row sums the 4-bit query codes over the
+    /// dims whose `_rabit_codes` sign bit is set, in both query layouts.
     #[test]
-    fn warmup_ip_x0_q_matches_and_popcount_formula() {
-        let data_word = 0xF0F0F0F0F0F0F0F0u64;
-        let data_be = data_word.to_le_bytes();
-        let planes = [
-            0xAAAAAAAAAAAAAAAA,
-            0xCCCCCCCCCCCCCCCC,
-            0x0000000000000000,
-            data_word,
-        ];
-        let delta = 0.25f32;
-        let vl = -1.875f32;
-        let mut ip = 0usize;
-        let ppc = data_word.count_ones() as usize;
-        for (j, plane) in planes.iter().enumerate() {
-            ip += ((data_word & plane).count_ones() as usize) << j;
-        }
-        let want = delta * ip as f32 + vl * ppc as f32;
-        let got = warmup_ip_x0_q(&data_be, &planes, delta, vl);
-        assert!(
-            (got - want).abs() <= 1e-6,
-            "warmup_ip_x0_q={got} want={want} ip={ip} ppc={ppc}"
-        );
-    }
-
-    #[test]
-    fn transpose_query_bin_be_puts_dim0_at_bit63_and_lsb_in_plane0() {
-        let mut codes = vec![0u8; 64];
-        codes[0] = 1;
-        codes[1] = 2;
-        codes[2] = 4;
-        codes[3] = 8;
-        let mut planes = vec![0u64; query_plane_words(64)];
-        transpose_query_bin_be(&codes, &mut planes);
-        assert_eq!(planes.len(), QUERY_WARMUP_BITS as usize);
-        assert_eq!(
-            planes[0],
-            1u64 << 63,
-            "LSB of dim0 must sit at bit 63 of plane 0"
-        );
-        assert_eq!(
-            planes[1],
-            1u64 << 62,
-            "bit1 of dim1 must sit at bit 62 of plane 1"
-        );
-        assert_eq!(planes[2], 1u64 << 61);
-        assert_eq!(planes[3], 1u64 << 60);
-    }
-
-    #[test]
-    fn transpose_query_bin_block_major_is_sequential_planes() {
-        let mut codes = vec![0u8; 128];
-        codes[0] = 1;
-        codes[64] = 1;
-        let mut block = vec![0u64; query_plane_words(128)];
-        let mut plane = vec![0u64; query_plane_words(128)];
-        transpose_query_bin_block_major(&codes, &mut block);
-        transpose_query_bin_be(&codes, &mut plane);
-        assert_eq!(block[0], 1u64 << 63, "block0 plane0");
-        assert_eq!(block[4], 1u64 << 63, "block1 plane0 follows block0 planes");
-        assert_ne!(block, plane, "dim=128 block-major != 512 plane-major");
-    }
-
-    #[test]
-    fn transpose_query_bin_be_is_plane_major_inside_512_superblock() {
-        let mut codes = vec![0u8; 128];
-        codes[0] = 1;
-        codes[64] = 1;
-        let mut planes = vec![0u64; query_plane_words(128)];
-        transpose_query_bin_be(&codes, &mut planes);
-        assert_eq!(planes.len(), 8);
-        assert_eq!(planes[0], 1u64 << 63, "plane0 block0");
-        assert_eq!(planes[1], 1u64 << 63, "plane0 block1 sits next to block0");
-        assert_eq!(planes[2], 0);
-    }
-
-    fn warmup_ip_popcount_oracle(
-        data_be: &[u8],
-        query: &[u64],
-        delta: f32,
-        vl: f32,
-        plane_major: bool,
-    ) -> f32 {
-        let nblk = data_be.len() / 8;
-        let bits = QUERY_WARMUP_BITS as usize;
-        let mut ip = 0u64;
-        let mut ppc = 0u64;
-        let mut blk = 0;
-        let mut q_off = 0;
-        while blk < nblk {
-            let nchunk = if plane_major { (nblk - blk).min(8) } else { 1 };
-            for k in 0..nchunk {
-                let off = (blk + k) * 8;
-                let x = u64::from_le_bytes(data_be[off..off + 8].try_into().unwrap());
-                ppc += x.count_ones() as u64;
-                for j in 0..bits {
-                    let y = if plane_major {
-                        query[q_off + j * nchunk + k]
-                    } else {
-                        query[(blk + k) * bits + j]
-                    };
-                    ip += ((x & y).count_ones() as u64) << j;
-                }
-            }
-            blk += nchunk;
-            q_off += nchunk * bits;
-        }
-        delta * ip as f32 + vl * ppc as f32
-    }
-
-    #[test]
-    fn warmup_ip_dispatch_matches_independent_popcount_oracle() {
+    fn test_warmup_ip_sums_query_codes_over_set_signs() {
         let mut rng = StdRng::seed_from_u64(7);
-        // 100/600 are not multiples of 64: they pin partial-tail handling in
-        // the block-major layout (100) and a partial 512-superblock (600).
-        // 8/32 exercise the smallest block-major inputs.
-        for dim in [8usize, 32, 64, 100, 128, 512, 576, 600, 640, 704, 768, 960] {
-            let nblk = padded_code_dim(dim) / 64;
-            let mut data = vec![0u8; nblk * 8];
-            rng.fill(data.as_mut_slice());
-            let mut codes = vec![0u8; dim];
-            rng.fill(codes.as_mut_slice());
+        // Below 512 dims the query is block-major; 576/640/960 end in a
+        // partial 512-dim superblock.
+        for dim in [8usize, 64, 128, 512, 576, 640, 960] {
+            let codes: Vec<u8> = (0..dim / 8).map(|_| rng.random()).collect();
+            let signs = sign_words_from_codes(&codes, dim / 8);
+            let query: Vec<u8> = (0..dim).map(|_| rng.random_range(0..16)).collect();
             let mut planes = vec![0u64; query_plane_words(dim)];
-            let plane_major = padded_code_dim(dim) >= 512;
-            if plane_major {
-                transpose_query_bin_be(&codes, &mut planes);
-            } else {
-                transpose_query_bin_block_major(&codes, &mut planes);
-            }
-            let delta = 0.31f32;
-            let vl = -2.25f32;
-            let want = warmup_ip_popcount_oracle(&data, &planes, delta, vl, plane_major);
-            let dispatch = warmup_ip_x0_q(&data, &planes, delta, vl);
-            let scalar = warmup_ip_x0_q_scalar(&data, &planes, delta, vl);
-            assert!(
-                (dispatch - want).abs() <= 1e-5,
-                "dim={dim} dispatch={dispatch} oracle={want}"
-            );
-            assert!(
-                (scalar - want).abs() <= 1e-5,
-                "dim={dim} scalar={scalar} oracle={want}"
-            );
-        }
-    }
-
-    #[test]
-    fn prepare_residual_warmup_query_picks_layout_by_dim() {
-        let mut rng = StdRng::seed_from_u64(3);
-        for (dim, plane_major) in [(128usize, false), (512, true)] {
-            let query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect();
-            let t_const = const_scaling_factor_3ex(padded_code_dim(dim));
-            let warmup = prepare_residual_warmup_query(&query, t_const);
-            let quantized = quantize_scalar_reconstruct(&query, t_const);
-            let mut planes = vec![0u64; query_plane_words(dim)];
-            if plane_major {
-                transpose_query_bin_be(&quantized.codes, &mut planes);
-            } else {
-                transpose_query_bin_block_major(&quantized.codes, &mut planes);
-            }
+            transpose_query_for_warmup(&query, &mut planes);
+            let is_set = |d: usize| (codes[d / 8] >> (d % 8)) & 1 == 1;
+            let ip: u32 = (0..dim)
+                .filter(|&d| is_set(d))
+                .map(|d| query[d] as u32)
+                .sum();
+            let count = (0..dim).filter(|&d| is_set(d)).count();
+            // `delta * ip + vl * popcount(signs)`
             assert_eq!(
-                warmup.planes, planes,
-                "prepare dim={dim} layout mismatch plane_major={plane_major}"
+                warmup_ip_x0_q(&signs, &planes, 1.0, 0.0),
+                ip as f32,
+                "{dim}"
+            );
+            assert_eq!(
+                warmup_ip_x0_q_scalar(&signs, &planes, 1.0, 0.0),
+                ip as f32,
+                "{dim}"
+            );
+            assert_eq!(
+                warmup_ip_x0_q(&signs, &planes, 0.0, 1.0),
+                count as f32,
+                "{dim}"
             );
         }
     }
 
+    /// Lib `quantize_scalar`: a positive value sets bit 3 over its 3 extra
+    /// bits, a non-positive one inverts the extra bits, and `vl` is `delta`
+    /// times the code bias.
     #[test]
-    fn quantize_scalar_zero_residual_is_zero() {
-        let got = quantize_scalar_reconstruct(&[0.0f32; 64], 12.0);
-        assert!(got.codes.iter().all(|&code| code == 0));
-        assert_eq!(got.delta, 0.0);
-        assert_eq!(got.vl, 0.0);
-    }
+    fn test_quantize_scalar_matches_lib() {
+        let zero = quantize_scalar_reconstruct(&[0.0; 64], 12.0);
+        assert!(zero.codes.iter().all(|&code| code == 0));
 
-    #[test]
-    fn quantize_scalar_flips_ex_bits_when_non_positive() {
-        // Lib `ex_bits_code` + `combined_code`: extra bits from |r|/||r||, then
-        // r<=0 → `(~tmp) & 7`; r>0 → tmp + (1<<3).
         let mut query = vec![0.0f32; 64];
         query[0] = 1.0;
         query[1] = -1.0;
         let t_const = 14.0;
-        let norm = 2.0f32.sqrt();
-        let tmp = ((t_const * (1.0 / norm as f64)) + 1e-5) as i32;
-        let tmp = tmp.clamp(0, 7);
+        let magnitude = 1.0 / 2.0f32.sqrt();
+        let extra = (((t_const * magnitude as f64) + 1e-5) as i32).clamp(0, 7) as u8;
         let got = quantize_scalar_reconstruct(&query, t_const);
-        assert_eq!(
-            got.codes[0],
-            (tmp + 8) as u8,
-            "positive dim keeps extra bits + sign"
-        );
-        assert_eq!(
-            got.codes[1],
-            ((!tmp) & 7) as u8,
-            "negative dim must invert extra bits, no sign"
-        );
-        assert_eq!(got.codes[2], 7, "zero dim is non-positive: invert 0 → 7");
-    }
-
-    #[test]
-    fn quantize_scalar_reconstruct_pins_vl_to_delta() {
-        let query: Vec<f32> = (0..64).map(|i| ((i % 11) as f32 - 5.0) * 0.17).collect();
-        let got = quantize_scalar_reconstruct(&query, 14.0);
-        // Lib derives the lower bound from the code bias, so vl tracks delta.
+        assert_eq!(got.codes[0], extra + 8);
+        assert_eq!(got.codes[1], !extra & 7);
+        assert_eq!(got.codes[2], 7);
         assert!((got.vl - got.delta * -7.5).abs() <= 1e-6);
-    }
-
-    #[test]
-    fn prepare_residual_warmup_query_sets_k1xsumq_and_planes() {
-        let mut query = vec![0.0f32; 64];
-        for (i, value) in query.iter_mut().enumerate() {
-            *value = ((i % 9) as f32 - 4.0) * 0.11;
-        }
-        let t_const = const_scaling_factor_3ex(padded_code_dim(64));
-        assert!(t_const.is_finite() && t_const > 0.0);
-        let warmup: ResidualWarmupQuery = prepare_residual_warmup_query(&query, t_const);
-        let sum_q: f32 = query.iter().sum();
-        assert!((warmup.k1xsumq - sum_q * -0.5).abs() <= 1e-6);
-        assert_eq!(warmup.planes.len(), query_plane_words(64));
-        let quantized = quantize_scalar_reconstruct(&query, t_const);
-        let mut planes = vec![0u64; query_plane_words(64)];
-        transpose_query_bin_block_major(&quantized.codes, &mut planes);
-        assert_eq!(warmup.planes, planes);
-        assert!((warmup.delta - quantized.delta).abs() <= 1e-6);
-        assert!((warmup.vl - quantized.vl).abs() <= 1e-6);
     }
 }

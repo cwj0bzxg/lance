@@ -3291,12 +3291,10 @@ async fn read_hnsw_build_params_from_sources(
 }
 
 fn hnsw_build_params_eq(left: &HnswBuildParams, right: &HnswBuildParams) -> bool {
-    // prefetch_distance only tunes read-ahead during graph walks; segments built
-    // with different values still produce structurally compatible graphs, so it
-    // must not gate segment merges.
     left.max_level == right.max_level
         && left.m == right.m
         && left.ef_construction == right.ef_construction
+        && left.prefetch_distance == right.prefetch_distance
 }
 
 async fn write_hnsw_root_index_from_auxiliary(
@@ -10190,23 +10188,5 @@ mod tests {
                 file.path
             );
         }
-    }
-
-    #[test]
-    fn test_hnsw_build_params_eq_ignores_prefetch_distance() {
-        let base = HnswBuildParams::default();
-        let mut other_prefetch = base.clone();
-        other_prefetch.prefetch_distance = base.prefetch_distance.map(|v| v + 1);
-        assert!(
-            hnsw_build_params_eq(&base, &other_prefetch),
-            "prefetch_distance is a search-time knob and must not gate segment merges"
-        );
-
-        let mut other_m = base.clone();
-        other_m.m += 1;
-        assert!(
-            !hnsw_build_params_eq(&base, &other_m),
-            "graph structure parameters must still be compared"
-        );
     }
 }

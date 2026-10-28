@@ -534,14 +534,10 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use half::f16;
-    use lance_arrow::FixedSizeListArrayExt;
+    use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
     use lance_index::vector::bq::raw_body::RAW_BODY_KIND;
     use lance_index::vector::bq::storage::RABIT_CODE_COLUMN;
-    use lance_index::vector::bq::sym::sym_bin_code_bytes;
-    use lance_index::vector::bq::transform::{
-        ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN, SYM_BIN_CODES_COLUMN, SYM_GAMMA_COLUMN,
-        SYM_IP_CENT_COLUMN, SYM_RHO_COLUMN, SYM_UNORM_COLUMN,
-    };
+    use lance_index::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
     use lance_index::vector::bq::{RQRotationType, builder::RabitQuantizer};
     use lance_index::vector::flat::index::FlatIndex;
     use lance_index::vector::flat::storage::FlatFloatStorage;
@@ -1078,106 +1074,38 @@ mod tests {
         );
     }
 
-    /// 1-bit SymRaBitQ (IVF_HNSW_RQ) storage: codes + factors + `__sym_*`.
-    fn make_rabit_sym_storage(
-        num_rows: usize,
-        code_dim: usize,
-        distance_type: DistanceType,
-    ) -> <RabitQuantizer as Quantization>::Storage {
-        let quantizer = RabitQuantizer::new_with_rotation::<Float32Type>(
-            1,
-            code_dim as i32,
-            RQRotationType::Fast,
-        );
-        let values: Vec<f32> = (0..num_rows * code_dim)
-            .map(|i| (i % 100) as f32 / 100.0 - 0.5)
-            .collect();
-        let vectors =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(values), code_dim as i32)
-                .unwrap();
-        let codes = quantizer
-            .quantize(&vectors)
-            .unwrap()
-            .as_fixed_size_list()
-            .clone();
-
-        let mut metadata = quantizer.metadata(None);
-        metadata.query_estimator = RabitQueryEstimator::RawQuery;
-        metadata.with_sym_columns = true;
-
-        let sym_bin_bytes = sym_bin_code_bytes(code_dim);
-        let sym_bins = FixedSizeListArray::try_new_from_values(
-            UInt8Array::from(vec![0xAAu8; num_rows * sym_bin_bytes]),
-            sym_bin_bytes as i32,
-        )
-        .unwrap();
-        let sym_scalars = || {
-            Arc::new(Float32Array::from_iter_values(
-                (0..num_rows).map(|i| i as f32 * 0.05 + 0.5),
-            )) as Arc<dyn arrow_array::Array>
-        };
-        let batch = RecordBatch::try_from_iter(vec![
-            (
-                lance_core::ROW_ID,
-                Arc::new(UInt64Array::from_iter_values(0..num_rows as u64))
-                    as Arc<dyn arrow_array::Array>,
-            ),
-            (
-                RABIT_CODE_COLUMN,
-                Arc::new(codes) as Arc<dyn arrow_array::Array>,
-            ),
-            (
-                ADD_FACTORS_COLUMN,
-                Arc::new(Float32Array::from_iter_values(
-                    (0..num_rows).map(|i| i as f32 * 0.1),
-                )) as Arc<dyn arrow_array::Array>,
-            ),
-            (
-                SCALE_FACTORS_COLUMN,
-                Arc::new(Float32Array::from_iter_values(
-                    (0..num_rows).map(|i| i as f32 * 0.01 + 0.5),
-                )) as Arc<dyn arrow_array::Array>,
-            ),
-            (
-                SYM_BIN_CODES_COLUMN,
-                Arc::new(sym_bins) as Arc<dyn arrow_array::Array>,
-            ),
-            (SYM_RHO_COLUMN, sym_scalars()),
-            (SYM_GAMMA_COLUMN, sym_scalars()),
-            (SYM_UNORM_COLUMN, sym_scalars()),
-            (SYM_IP_CENT_COLUMN, sym_scalars()),
-        ])
-        .unwrap();
-
-        <RabitQuantizer as Quantization>::Storage::try_from_batch(
-            batch,
-            &metadata,
-            distance_type,
-            None,
-        )
-        .unwrap()
-    }
-
     #[test]
     fn test_roundtrip_rabitq_with_sym_columns() {
-        // The sym columns must survive the cache round trip: the reader derives
-        // `with_sym_columns` from their presence, so a reloaded IVF_HNSW_RQ
-        // partition still walks on the sym columns.
-        let storage = make_rabit_sym_storage(40, 64, DistanceType::L2);
-        assert!(storage.metadata().with_sym_columns);
-        assert_eq!(
-            storage.metadata().query_estimator,
-            RabitQueryEstimator::RawQuery
+        let storage = make_rabit_storage(
+            40,
+            64,
+            DistanceType::L2,
+            RQRotationType::Fast,
+            RabitQueryEstimator::RawQuery,
         );
+        let mut metadata = storage.metadata().clone();
+        metadata.with_sym_columns = true;
+        let mut batch = storage.to_batches().unwrap().next().unwrap();
+        for name in SYM_COLUMNS {
+            let factors = Arc::new(Float32Array::from(vec![1.0; batch.num_rows()]));
+            batch = batch
+                .try_with_column(Field::new(name, DataType::Float32, true), factors)
+                .unwrap();
+        }
+        let storage = <RabitQuantizer as Quantization>::Storage::try_from_batch(
+            batch,
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
         let entry = PartitionEntry::<FlatIndex, RabitQuantizer>::new(FlatIndex::default(), storage);
 
-        let bytes = ser_body(&entry);
-        let restored = de_body::<PartitionEntry<FlatIndex, RabitQuantizer>>(bytes).unwrap();
+        // The reader derives `with_sym_columns` from the sym columns, so they
+        // must survive the cache round trip.
+        let restored =
+            de_body::<PartitionEntry<FlatIndex, RabitQuantizer>>(ser_body(&entry)).unwrap();
         assert!(restored.storage.metadata().with_sym_columns);
-        assert_eq!(
-            restored.storage.metadata().query_estimator,
-            RabitQueryEstimator::RawQuery
-        );
         assert_eq!(restored.storage.len(), entry.storage.len());
     }
 

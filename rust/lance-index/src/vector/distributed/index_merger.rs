@@ -26,8 +26,7 @@ use crate::vector::bq::storage::{
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
-    SCALE_FACTORS_FIELD, SYM_GAMMA_FIELD, SYM_IP_CENT_FIELD, SYM_RHO_FIELD, SYM_UNORM_FIELD,
-    sym_bin_codes_field,
+    SCALE_FACTORS_FIELD, SYM_FIELDS,
 };
 use crate::vector::bq::validate_rq_num_bits;
 use crate::vector::flat::index::FlatMetadata;
@@ -385,11 +384,7 @@ pub async fn init_writer_for_rq(
         fields.push(EX_SCALE_FACTORS_FIELD.clone());
     }
     if rq_meta.with_sym_columns {
-        fields.push(sym_bin_codes_field(rq_meta.rotated_dim()));
-        fields.push(SYM_RHO_FIELD.clone());
-        fields.push(SYM_GAMMA_FIELD.clone());
-        fields.push(SYM_UNORM_FIELD.clone());
-        fields.push(SYM_IP_CENT_FIELD.clone());
+        fields.extend(SYM_FIELDS.iter().cloned());
     }
     let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;

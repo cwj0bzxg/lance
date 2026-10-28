@@ -22,8 +22,7 @@ use crate::vector::bq::storage::{
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
-    RabitRowFactors, SCALE_FACTORS_FIELD, SYM_GAMMA_FIELD, SYM_IP_CENT_FIELD, SYM_RHO_FIELD,
-    SYM_UNORM_FIELD, sym_bin_codes_field,
+    RabitRowFactors, SCALE_FACTORS_FIELD, SYM_FIELDS,
 };
 use crate::vector::bq::{
     RABIT_DEFAULT_NUM_BITS, RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits,
@@ -1185,11 +1184,7 @@ impl Quantization for RabitQuantizer {
             fields.push(EX_SCALE_FACTORS_FIELD.clone());
         }
         if self.metadata.with_sym_columns {
-            fields.push(sym_bin_codes_field(self.code_dim()));
-            fields.push(SYM_RHO_FIELD.clone());
-            fields.push(SYM_GAMMA_FIELD.clone());
-            fields.push(SYM_UNORM_FIELD.clone());
-            fields.push(SYM_IP_CENT_FIELD.clone());
+            fields.extend(SYM_FIELDS.iter().cloned());
         }
         fields
     }
