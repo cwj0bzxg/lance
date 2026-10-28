@@ -352,11 +352,6 @@ impl RabitQuantizationMetadata {
     pub fn binary_code_bytes(&self) -> usize {
         rabit_binary_code_bytes(self.rotated_dim())
     }
-
-    /// The `__sym_*` columns back the HNSW walk. Flat `IVF_RQ` never sets this.
-    pub fn uses_sym_columns(&self) -> bool {
-        self.with_sym_columns
-    }
 }
 
 fn default_rotation_type_compat() -> RQRotationType {
@@ -2177,7 +2172,7 @@ pub(crate) fn has_sym_columns(batch: &RecordBatch) -> bool {
 }
 
 fn require_sym_columns(batch: &RecordBatch, metadata: &RabitQuantizationMetadata) -> Result<()> {
-    if !metadata.uses_sym_columns() {
+    if !metadata.with_sym_columns {
         return Ok(());
     }
     if !has_sym_columns(batch) {

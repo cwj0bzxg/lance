@@ -23,6 +23,7 @@ use lance_index::vector::bq::RQRotationType;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::raw_body::{read_raw_batch, write_raw_batch};
 use lance_index::vector::bq::storage::{RabitQuantizationMetadata, RabitQueryEstimator};
+use lance_index::vector::bq::transform::SYM_COLUMNS;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatMetadata, FlatQuantizer};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::pq::storage::ProductQuantizationMetadata;
@@ -501,15 +502,9 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             // The storage batch already has packed codes; skip re-packing.
             packed: true,
             query_estimator,
-            with_sym_columns: [
-                "__sym_bin_codes",
-                "__sym_rho",
-                "__sym_gamma",
-                "__sym_unorm",
-                "__sym_ip_cent",
-            ]
-            .iter()
-            .all(|name| storage_batch.column_by_name(name).is_some()),
+            with_sym_columns: SYM_COLUMNS
+                .iter()
+                .all(|name| storage_batch.column_by_name(name).is_some()),
         };
         let storage = <RabitQuantizer as Quantization>::Storage::try_from_batch(
             storage_batch,
@@ -1388,7 +1383,6 @@ mod tests {
             index_file_size: 1024,
             aux_file_size: 512,
             rq_search_cache: empty_rabit_search_cache_cell(),
-            scratch_pool: Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = IvfStateEntryBox(Arc::new(state));

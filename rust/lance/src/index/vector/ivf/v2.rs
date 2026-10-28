@@ -137,13 +137,6 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     pub(crate) aux_file_size: u64,
     /// Runtime-only cache, intentionally excluded from the CacheCodec wire format.
     pub(crate) rq_search_cache: RabitSearchCacheCell,
-    /// Shared query scratch pool, populated on first reconstruction so warm
-    /// queries reuse the zero-filled buffers instead of paying a fresh
-    /// `vec![0; cap]` per query. Runtime-only, excluded from the wire format.
-    /// Note: on the deserialize path the pool attaches via `get_or_init`
-    /// after the cache entry is weighed, so its bytes escape cache size
-    /// accounting there (accepted: pools were entirely unaccounted before).
-    pub(crate) scratch_pool: Arc<OnceLock<Arc<QueryScratchPool>>>,
 }
 
 /// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
@@ -645,11 +638,6 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
                 .and_then(|cache| cache.as_ref().and_then(|cache| cache.as_ref().cloned()))
                 .map(|cache| cache.rotated_centroids.len() * std::mem::size_of::<f32>())
                 .unwrap_or_default()
-            + self
-                .scratch_pool
-                .get()
-                .map(|pool| pool.deep_size_of_children(context))
-                .unwrap_or_default()
     }
 }
 
@@ -758,7 +746,6 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
                 rq_search_cache: empty_rabit_search_cache_cell(),
-                scratch_pool: Arc::new(OnceLock::new()),
             })))
         }
 
@@ -1270,8 +1257,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         if Q::quantization_type() == QuantizationType::Rabit
             && let Ok(Quantizer::Rabit(rq)) = storage.quantizer()
         {
-            // Sym columns are scored as a raw query. Their stored factors
-            // already include the centroid, and HNSW ignores QueryResidual.
             return rq.metadata_ref().query_estimator == RabitQueryEstimator::ResidualQuery;
         }
         Q::use_residual(distance_type)
@@ -1287,7 +1272,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let Quantizer::Rabit(rq) = storage.quantizer()? else {
             return Ok(None);
         };
-        if rq.metadata_ref().uses_sym_columns()
+        if rq.metadata_ref().with_sym_columns
             || rq.metadata_ref().query_estimator != RabitQueryEstimator::RawQuery
         {
             return Ok(None);
@@ -1328,7 +1313,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let Quantizer::Rabit(rq) = self.storage.quantizer()? else {
             return Ok(None);
         };
-        if rq.metadata_ref().uses_sym_columns()
+        if rq.metadata_ref().with_sym_columns
             || rq.metadata_ref().query_estimator != RabitQueryEstimator::RawQuery
         {
             return Ok(None);
@@ -1611,7 +1596,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: &IvfModel,
         storage: &IvfQuantizationStorage<Q>,
     ) -> QueryScratchCapacity {
-        if Q::quantization_type() != QuantizationType::Rabit {
+        // Only the flat RaBitQ scan reads the per-row scratch buffers; HNSW
+        // walks its graph without them.
+        if Q::quantization_type() != QuantizationType::Rabit
+            || S::name() != <FlatIndex as IvfSubIndex>::name()
+        {
             return QueryScratchCapacity::default();
         }
 
@@ -1826,15 +1815,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         io_parallelism: usize,
         rq_search_cache: Option<Arc<RabitSearchCache>>,
         origin_latency: OriginLatencyClass,
-        shared_scratch_pool: Arc<OnceLock<Arc<QueryScratchPool>>>,
     ) -> Result<Self> {
         let storage = storage.with_origin_latency(origin_latency);
-        // Reuse the cached state's pool: a fresh pool starts empty, so the
-        // first checkout of every query would reallocate and zero-fill the
-        // scratch buffers (up to `max_partition_len` entries).
-        let scratch_pool = shared_scratch_pool
-            .get_or_init(|| Arc::new(Self::query_scratch_pool(&ivf, &storage)))
-            .clone();
+        let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf, &storage));
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let read_projection = Self::read_projection(&reader)?;
@@ -2626,13 +2609,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
-            scratch_pool: {
-                // Hand the live pool to warm-path reconstructions so they
-                // reuse its already-zeroed scratch buffers.
-                let cell = Arc::new(OnceLock::new());
-                let _ = cell.set(self.scratch_pool.clone());
-                cell
-            },
         }))
     }
 }
@@ -3673,7 +3649,6 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         io_parallelism,
         rq_search_cache,
         origin_latency,
-        state.scratch_pool.clone(),
     )?;
     index.rabit_scan = rabit_scan;
     Ok(Arc::new(index))

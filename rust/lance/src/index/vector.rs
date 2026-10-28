@@ -523,15 +523,12 @@ impl VectorIndexParams {
     }
 
     /// Create index parameters with `IVF`, `HNSW` and `RQ` parameters.
-    ///
-    /// Sets `with_sym_columns` so the index writes `__sym_*`. Flat `IVF_RQ` does not.
     pub fn with_ivf_hnsw_rq_params(
         metric_type: MetricType,
         ivf: IvfBuildParams,
         hnsw: HnswBuildParams,
-        mut rq: RQBuildParams,
+        rq: RQBuildParams,
     ) -> Self {
-        rq.with_sym_columns = true;
         let stages = vec![
             StageParams::Ivf(ivf),
             StageParams::Hnsw(hnsw),
@@ -1180,7 +1177,10 @@ pub(crate) async fn build_distributed_vector_index(
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
-                Some(rq_params.clone()),
+                Some(RQBuildParams {
+                    with_sym_columns: true,
+                    ..rq_params.clone()
+                }),
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
@@ -1637,7 +1637,10 @@ async fn build_vector_index_impl(
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
-                Some(rq_params.clone()),
+                Some(RQBuildParams {
+                    with_sym_columns: true,
+                    ..rq_params.clone()
+                }),
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
@@ -2404,7 +2407,6 @@ fn derive_rabit_params(rabit_quantizer: &RabitQuantizer) -> RQBuildParams {
         num_bits: rabit_quantizer.num_bits(),
         rotation_type: rabit_quantizer.rotation_type(),
         rotation: None,
-        query_estimator: rabit_quantizer.metadata_ref().query_estimator,
         with_sym_columns: rabit_quantizer.metadata_ref().with_sym_columns,
     }
 }
@@ -2556,13 +2558,11 @@ pub(crate) fn fresh_vector_segment_params(
         }
         (SubIndexType::Hnsw, QuantizationType::Rabit) => {
             let quantizer: RabitQuantizer = quantizer.try_into()?;
-            let mut rq_params = derive_rabit_params(&quantizer);
-            rq_params.with_sym_columns = true;
             VectorIndexParams::with_ivf_hnsw_rq_params(
                 metric_type,
                 ivf_params,
                 derive_hnsw_params(index),
-                rq_params,
+                derive_rabit_params(&quantizer),
             )
         }
     })

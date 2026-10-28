@@ -14,7 +14,7 @@ use lance_core::{Error, Result};
 use num_traits::Float;
 use serde::{Deserialize, Serialize};
 
-use crate::vector::bq::storage::{RabitQuantizationMetadata, RabitQueryEstimator};
+use crate::vector::bq::storage::RabitQuantizationMetadata;
 use crate::vector::quantizer::QuantizerBuildParams;
 
 pub mod builder;
@@ -131,15 +131,8 @@ pub struct RQBuildParams {
     /// rotates vectors identically. This is transient build-time state and is never
     /// persisted to the `RabitQuantization` params proto.
     pub rotation: Option<RabitQuantizationMetadata>,
-    /// Search estimator written into RQ metadata. Selects the F_* formula only.
-    ///
-    /// `IVF_RQ` and `IVF_HNSW_RQ` both write [`RabitQueryEstimator::RawQuery`].
-    /// 1-bit vs multi-bit scoring is `RabitDistCalculator::binary_only`
-    /// (set from [`Self::with_sym_columns`] / `num_bits` / `ApproxMode`), not
-    /// this field.
-    pub query_estimator: RabitQueryEstimator,
-    /// Write the SymRaBitQ `__sym_*` columns and walk the graph on the 1-bit
-    /// warmup. Only `IVF_HNSW_RQ` sets this. `IVF_RQ` leaves it false.
+    /// Whether to write the SymRaBitQ `__sym_*` columns that `IVF_HNSW_RQ`
+    /// builds and walks its graph on. The `IVF_HNSW_RQ` build sets this.
     pub with_sym_columns: bool,
 }
 
@@ -182,7 +175,6 @@ impl RQBuildParams {
             num_bits,
             rotation_type: RQRotationType::default(),
             rotation: None,
-            query_estimator: RabitQueryEstimator::RawQuery,
             with_sym_columns: false,
         }
     }
@@ -192,7 +184,6 @@ impl RQBuildParams {
             num_bits,
             rotation_type,
             rotation: None,
-            query_estimator: RabitQueryEstimator::RawQuery,
             with_sym_columns: false,
         }
     }
@@ -223,7 +214,6 @@ impl Default for RQBuildParams {
             num_bits: RABIT_DEFAULT_NUM_BITS,
             rotation_type: RQRotationType::default(),
             rotation: None,
-            query_estimator: RabitQueryEstimator::RawQuery,
             with_sym_columns: false,
         }
     }

@@ -144,7 +144,7 @@ impl RQTransformer {
             rayon::iter::Either::Right(ex_add.par_iter_mut().zip(ex_scale.par_iter_mut()).map(Some))
         };
         // SymRaBitQ columns are accumulated in the same quantization pass.
-        let with_sym = self.rq.metadata_ref().uses_sym_columns();
+        let with_sym = self.rq.metadata_ref().with_sym_columns;
         let sym_rows = if with_sym { num_rows } else { 0 };
         let sym_bin_bytes = sym_bin_code_bytes(dim);
         let mut sym_bins = vec![0u8; sym_rows * sym_bin_bytes];
@@ -642,7 +642,7 @@ impl Transformer for RQTransformer {
                 && batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
                 && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some());
         if batch.column_by_name(RABIT_CODE_COLUMN).is_some() && has_split_codes {
-            if !self.rq.metadata_ref().uses_sym_columns() || has_sym_columns(batch) {
+            if !self.rq.metadata_ref().with_sym_columns || has_sym_columns(batch) {
                 return Ok(batch.clone());
             }
             return Err(Error::index(

@@ -384,7 +384,7 @@ pub async fn init_writer_for_rq(
         fields.push(EX_ADD_FACTORS_FIELD.clone());
         fields.push(EX_SCALE_FACTORS_FIELD.clone());
     }
-    if rq_meta.uses_sym_columns() {
+    if rq_meta.with_sym_columns {
         fields.push(sym_bin_codes_field(rq_meta.rotated_dim()));
         fields.push(SYM_RHO_FIELD.clone());
         fields.push(SYM_GAMMA_FIELD.clone());
@@ -1184,13 +1184,15 @@ async fn merge_partial_vector_auxiliary_files_inner(
                         || existing_rq.fast_rotation_signs != rq_meta_parsed.fast_rotation_signs)
                 {
                     return Err(Error::index(format!(
-                        "Distributed RQ merge: structural mismatch across shards; first(code_dim={}, num_bits={}, rotation_type={:?}), current(code_dim={}, num_bits={}, rotation_type={:?})",
+                        "Distributed RQ merge: structural mismatch across shards; first(code_dim={}, num_bits={}, rotation_type={:?}, with_sym_columns={}), current(code_dim={}, num_bits={}, rotation_type={:?}, with_sym_columns={})",
                         existing_rq.code_dim,
                         existing_rq.num_bits,
                         existing_rq.rotation_type,
+                        existing_rq.with_sym_columns,
                         rq_meta_parsed.code_dim,
                         rq_meta_parsed.num_bits,
-                        rq_meta_parsed.rotation_type
+                        rq_meta_parsed.rotation_type,
+                        rq_meta_parsed.with_sym_columns
                     )));
                 }
                 if let Some(existing_rq) = rq_meta.as_ref() {

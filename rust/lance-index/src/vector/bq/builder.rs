@@ -626,6 +626,12 @@ impl RabitQuantizer {
                 metadata.num_bits, params.num_bits
             )));
         }
+        if params.with_sym_columns && metadata.query_estimator != RabitQueryEstimator::RawQuery {
+            return Err(Error::invalid_input(format!(
+                "rabitq_model uses the {:?} estimator, but the __sym_* columns require RawQuery",
+                metadata.query_estimator
+            )));
+        }
 
         let rotated_dim = metadata.rotated_dim();
         if rotated_dim != dim {
@@ -1066,24 +1072,7 @@ impl Quantization for RabitQuantizer {
                 "vector dimension must be divisible by 8 for IVF_RQ",
             ));
         }
-        if params.with_sym_columns && params.query_estimator != RabitQueryEstimator::RawQuery {
-            return Err(Error::invalid_input(
-                "SymRaBitQ (with_sym_columns) requires the raw-query estimator".to_string(),
-            ));
-        }
-        // The residual-query estimator only survives for reading legacy 1-bit
-        // indexes. Multi-bit writes use the raw-query F_* factor layout, which
-        // a residual-query reader would misinterpret.
-        if params.query_estimator == RabitQueryEstimator::ResidualQuery && params.num_bits > 1 {
-            return Err(Error::invalid_input(format!(
-                "the residual-query estimator is legacy 1-bit only, but num_bits = {}; \
-                 multi-bit RQ requires the raw-query estimator",
-                params.num_bits
-            )));
-        }
-
         if let Some(mut q) = Self::from_supplied_rotation(params, dim)? {
-            q.metadata.query_estimator = params.query_estimator;
             q.metadata.with_sym_columns = params.with_sym_columns;
             return Ok(q);
         }
@@ -1111,7 +1100,6 @@ impl Quantization for RabitQuantizer {
                 )));
             }
         };
-        q.metadata.query_estimator = params.query_estimator;
         q.metadata.with_sym_columns = params.with_sym_columns;
         Ok(q)
     }
@@ -1196,7 +1184,7 @@ impl Quantization for RabitQuantizer {
             fields.push(EX_ADD_FACTORS_FIELD.clone());
             fields.push(EX_SCALE_FACTORS_FIELD.clone());
         }
-        if self.metadata.uses_sym_columns() {
+        if self.metadata.with_sym_columns {
             fields.push(sym_bin_codes_field(self.code_dim()));
             fields.push(SYM_RHO_FIELD.clone());
             fields.push(SYM_GAMMA_FIELD.clone());
@@ -1757,6 +1745,14 @@ mod tests {
         let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
         assert!(err.to_string().contains("does not match vector dimension"));
 
+        let mut residual_query = supplied.clone();
+        residual_query.query_estimator = RabitQueryEstimator::ResidualQuery;
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        params.rotation = Some(residual_query);
+        params.with_sym_columns = true;
+        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(err.to_string().contains("require RawQuery"), "{err}");
+
         let mut wrong_sign_len = supplied;
         wrong_sign_len.fast_rotation_signs.as_mut().unwrap().pop();
         let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
@@ -1809,36 +1805,5 @@ mod tests {
             "{}",
             err
         );
-    }
-
-    #[test]
-    fn test_rabit_quantizer_rejects_sym_columns_without_raw_query() {
-        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
-        let fsl = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
-        let mut params = RQBuildParams::with_rotation_type(5, RQRotationType::Fast);
-        params.with_sym_columns = true;
-        params.query_estimator = RabitQueryEstimator::ResidualQuery;
-        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
-        assert!(err.to_string().contains("raw-query estimator"), "{}", err);
-    }
-
-    #[test]
-    fn test_rabit_quantizer_rejects_multi_bit_residual_query() {
-        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
-        let fsl = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
-        let mut params = RQBuildParams::with_rotation_type(5, RQRotationType::Fast);
-        params.query_estimator = RabitQueryEstimator::ResidualQuery;
-        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("residual-query estimator is legacy 1-bit only"),
-            "{}",
-            err
-        );
-
-        // 1-bit residual writes stay allowed: that is the legacy IVF_RQ layout.
-        let mut params = RQBuildParams::with_rotation_type(1, RQRotationType::Fast);
-        params.query_estimator = RabitQueryEstimator::ResidualQuery;
-        RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap();
     }
 }

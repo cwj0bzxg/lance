@@ -4839,7 +4839,6 @@ version = "15.0.0-beta.3"
 dependencies = [
  "all_asserts",
  "arrow",
- "arrow-array",
  "arrow-schema",
  "arrow-select",
  "clap",
@@ -4848,7 +4847,6 @@ dependencies = [
  "hf-hub",
  "itertools 0.14.0",
  "lance",
- "lance-arrow",
  "lance-core",
  "lance-datagen",
  "lance-index",

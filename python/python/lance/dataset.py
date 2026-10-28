@@ -4629,17 +4629,10 @@ class LanceDataset(pa.dataset.Dataset):
             - index_file_version
                 The version of the index file. Default is "V3".
 
-        Optional parameters for `IVF_RQ`:
+        Optional parameters for `IVF_RQ` and `IVF_HNSW_RQ`:
 
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 5.
-
-        Optional parameters for `IVF_HNSW_RQ`:
-
-            - num_bits
-                The number of bits for RQ. Default is 5. Values above 1 add an
-                ex-code rerank layer, which improves recall at the cost of
-                storage and build time.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -7393,10 +7386,10 @@ class ScannerBuilder:
         approx_mode: {"fast", "normal", "accurate"}, default "normal"
             Controls the speed / accuracy tradeoff for approximate vector search
             when supported by the selected index. This currently only affects
-            RQ-quantized indexes, such as IVF_RQ and IVF_HNSW_RQ. Other index
-            types ignore this setting. ``fast`` favors lower latency and may
-            reduce recall, ``normal`` uses the default balance, and
-            ``accurate`` favors higher recall and may increase latency.
+            RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
+            setting. ``fast`` favors lower latency and may reduce recall,
+            ``normal`` uses the default balance, and ``accurate`` favors higher
+            recall and may increase latency.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -8769,10 +8762,10 @@ def _build_vector_search_query(
     approx_mode: {"fast", "normal", "accurate"}, default "normal"
         Controls the speed / accuracy tradeoff for approximate vector search
         when supported by the selected index. This currently only affects
-        RQ-quantized indexes, such as IVF_RQ and IVF_HNSW_RQ. Other index
-        types ignore this setting. ``fast`` favors lower latency and may
-        reduce recall, ``normal`` uses the default balance, and ``accurate``
-        favors higher recall and may increase latency.
+        RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
+        setting. ``fast`` favors lower latency and may reduce recall,
+        ``normal`` uses the default balance, and ``accurate`` favors higher
+        recall and may increase latency.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper
