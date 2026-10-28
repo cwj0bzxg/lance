@@ -317,3 +317,70 @@ async fn test_rabit_scan_factory_rebinds_from_current_session(
         TestScanBehavior::OpenError => unreachable!(),
     }
 }
+
+/// The native planes do not carry the `__sym_*` columns `IVF_HNSW_RQ` walks
+/// on, so its partitions stay on whole-partition reads under any strategy.
+#[tokio::test]
+async fn test_rabit_scan_factory_skips_ivf_hnsw_rq() {
+    let dir = TempStrDir::default();
+    let (mut dataset, batch) = native_fixture(dir.as_str()).await;
+    let vectors = batch["vector"].as_fixed_size_list();
+    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+        DistanceType::L2,
+        IvfBuildParams::try_with_centroids(4, Arc::new(vectors.slice(0, 4))).unwrap(),
+        HnswBuildParams::default(),
+        RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("hnsw_rq".to_string()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let uuid = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == "hnsw_rq")
+        .unwrap()
+        .uuid;
+    let query = lazy_test_query(vectors.value(0), 8, 4);
+    let ordinary = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let expected = result_bits(
+        &search_global(&ordinary, &query, Arc::new(NoFilter))
+            .await
+            .unwrap(),
+    );
+
+    let factory = Arc::new(RecordingScanFactory {
+        opens: Arc::default(),
+        searches: Arc::default(),
+        behavior: TestScanBehavior::Full,
+        cache_layout: RabitCacheLayout::Planes,
+    });
+    let configured = open_with_session(
+        dir.as_str(),
+        Session::default().with_rabit_scan_factory(factory.clone()),
+    )
+    .await;
+    // The second open rebuilds the index from its cached state.
+    for _ in 0..2 {
+        let index = configured
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let actual = search_global(&index, &query, Arc::new(NoFilter))
+            .await
+            .unwrap();
+        assert_eq!(result_bits(&actual), expected);
+    }
+    assert_eq!(factory.opens.load(Ordering::Relaxed), 0);
+}

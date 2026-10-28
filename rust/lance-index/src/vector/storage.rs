@@ -1893,12 +1893,15 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Whether this file exposes the current RaBitQ sign/ex plane primitives.
     /// Historical native encodings and one-bit indices keep their ordinary
     /// partition reader; they are not adapted into the new scan path.
+    /// `IVF_HNSW_RQ` also needs its `__sym_*` columns, which the planes do
+    /// not carry, so it stays on whole-partition reads.
     pub fn supports_rabit_planes(&self) -> bool {
         let Ok(Quantizer::Rabit(rq)) = self.quantizer() else {
             return false;
         };
         let metadata = rq.metadata_ref();
         (2..=9).contains(&metadata.num_bits)
+            && !metadata.with_sym_columns
             && metadata.packed
             && metadata.query_estimator == RabitQueryEstimator::RawQuery
             && self
