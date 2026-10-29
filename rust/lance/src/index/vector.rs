@@ -781,7 +781,7 @@ async fn prepare_vector_segment_build(
     }
 
     let index_type = params.index_type();
-    if index_type == IndexType::IvfRq {
+    if matches!(index_type, IndexType::IvfRq | IndexType::IvfHnswRq) {
         let Some(StageParams::RQ(rq_params)) = stages.last() else {
             return Err(Error::index(format!(
                 "{mode}: invalid stages: {:?}",
@@ -1340,7 +1340,9 @@ async fn build_vector_index_impl(
 
     // RaBitQ encodes against L2 or dot residuals, and its transform rejects
     // anything else, but only after the IVF model has been trained on a sample.
-    if index_type == IndexType::IvfRq && params.metric_type == DistanceType::Hamming {
+    if matches!(index_type, IndexType::IvfRq | IndexType::IvfHnswRq)
+        && params.metric_type == DistanceType::Hamming
+    {
         return Err(Error::index(format!(
             "Build Vector Index: {} does not support the {} metric",
             index_type, params.metric_type
@@ -1645,6 +1647,7 @@ async fn build_vector_index_impl(
                 frag_reuse_index,
             )?
             .with_optional_fragment_filter(fragment_ids)
+            .with_train_only(train_only)
             .with_progress(progress.clone())
             .build()
             .await?;
@@ -2587,6 +2590,7 @@ mod tests {
     use lance_index::vector::ivf::builder::IvfBuildParams;
     use lance_linalg::distance::MetricType;
     use roaring::RoaringTreemap;
+    use rstest::rstest;
 
     #[tokio::test]
     async fn test_nullable_vector_count_stops_at_threshold() {
@@ -2708,11 +2712,41 @@ mod tests {
     /// IVF_RQ encodes residuals under L2 or dot; the RQ transform rejects other
     /// metrics, but only once the IVF model has been trained, so the build spends
     /// the training pass before failing. Hamming is also contradictory for RQ,
-    /// which requires float vectors while Hamming is a binary-vector metric.
+    /// which requires float vectors while Hamming is a binary-vector metric. An
+    /// out-of-range `num_bits` is likewise rejected before training.
+    #[rstest]
+    #[case::ivf_rq(
+        VectorIndexParams::with_ivf_rq_params(
+            MetricType::Hamming,
+            IvfBuildParams::new(2),
+            RQBuildParams::default(),
+        ),
+        "IVF_RQ does not support the hamming metric"
+    )]
+    #[case::ivf_hnsw_rq(
+        VectorIndexParams::with_ivf_hnsw_rq_params(
+            MetricType::Hamming,
+            IvfBuildParams::new(2),
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        ),
+        "IVF_HNSW_RQ does not support the hamming metric"
+    )]
+    #[case::ivf_hnsw_rq_num_bits(
+        VectorIndexParams::with_ivf_hnsw_rq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            HnswBuildParams::default(),
+            RQBuildParams::new(10),
+        ),
+        "num_bits must be in 1..=9, got 10"
+    )]
     #[tokio::test]
-    async fn test_build_rejects_hamming_for_rq() {
+    async fn test_build_rejects_invalid_rq_params(
+        #[case] params: VectorIndexParams,
+        #[case] message: &str,
+    ) {
         use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-        use lance_index::vector::bq::RQBuildParams;
 
         let dim = 16;
         let mut dataset = lance_datagen::gen_batch()
@@ -2724,19 +2758,13 @@ mod tests {
             .await
             .unwrap();
 
-        let params = VectorIndexParams::with_ivf_rq_params(
-            MetricType::Hamming,
-            IvfBuildParams::new(2),
-            RQBuildParams::default(),
-        );
         let err = dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
             .await
             .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("IVF_RQ does not support the hamming metric"),
-            "expected the up-front metric rejection, got: {err}"
+            err.to_string().contains(message),
+            "expected the up-front rejection, got: {err}"
         );
     }
 
@@ -4452,6 +4480,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 5, "Should return 5 nearest neighbors");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_vector_index_ivf_hnsw_rq() {
+        let test_dir = TempStrDir::default();
+        let write = |uri: String, rows: u64| async move {
+            let reader = lance_datagen::gen_batch()
+                .col("id", array::step::<Int32Type>())
+                .col("vector", array::rand_vec::<Float32Type>(32.into()))
+                .into_reader_rows(RowCount::from(rows), BatchCount::from(1));
+            Dataset::write(reader, &uri, None).await.unwrap()
+        };
+        let mut source = write(format!("{}/source", test_dir.as_str()), 300).await;
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            MetricType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            RQBuildParams::new(3),
+        );
+        source
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let source_index = source.load_indices().await.unwrap()[0].clone();
+
+        let mut target = write(format!("{}/target", test_dir.as_str()), 100).await;
+        initialize_vector_index(&mut target, &source, &source_index, &["vector"])
+            .await
+            .unwrap();
+
+        let target_index = target.load_indices().await.unwrap()[0].clone();
+        let stats = target
+            .open_vector_index("vector", &target_index.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .statistics()
+            .unwrap();
+        assert_eq!(stats["index_type"], "IVF_HNSW_RQ");
+        assert_eq!(stats["num_partitions"], 4);
+        assert_eq!(stats["sub_index"]["num_bits"], 3);
+        let query = Float32Array::from(vec![0.5; 32]);
+        let hits = target
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(hits.num_rows(), 5);
     }
 
     #[tokio::test]

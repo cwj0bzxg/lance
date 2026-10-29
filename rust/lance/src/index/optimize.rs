@@ -1314,7 +1314,9 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-    use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
+    use lance_index::vector::{
+        bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+    };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
 
@@ -1646,6 +1648,44 @@ mod tests {
                 .iter()
                 .all(|task| task.reference.uuid == rebuilt[0].uuid)
         );
+    }
+
+    /// A bounded retrain's model segment carries the trained model only; IVF_HNSW_RQ
+    /// must not encode the table or build graphs for it.
+    #[tokio::test]
+    async fn test_vector_retrain_model_segment_is_empty_for_ivf_hnsw_rq() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = write_dataset(&test_dir, 1000, 500).await;
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(VECTOR_INDEX.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let options = OptimizeOptions::retrain()
+            .max_rows_per_task(Some(500))
+            .max_rows_per_segment(Some(500));
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        let model = dataset
+            .open_vector_index_from_metadata(
+                "vector",
+                &plan.tasks[0].reference,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(model.num_rows(), 0);
     }
 
     #[tokio::test]
