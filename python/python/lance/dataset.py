@@ -4821,7 +4821,7 @@ class LanceDataset(pa.dataset.Dataset):
           interprets partition ids within that segment. Keep independently
           trained segments as separate physical segments unless the merge
           workflow can preserve or reconcile the model state.
-        - ``rabitq_model`` (``IVF_RQ`` only): a JSON string produced by
+        - ``rabitq_model`` (``IVF_RQ`` and ``IVF_HNSW_RQ``): a JSON string produced by
           ``lance.lance.indices.build_rq_model``. It must be identical across all
           workers for their segments to be mergeable, since it pins the RaBitQ
           rotation so every segment rotates vectors the same way. If omitted, each

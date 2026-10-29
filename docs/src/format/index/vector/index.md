@@ -54,8 +54,10 @@ The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
 The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
 
-`IVF_RQ` records `index_version` 2. `IVF_HNSW_RQ` records `index_version` 3, which
-adds the `__sym_*` columns to the auxiliary file. `IVF_RQ` files never contain them.
+`index_version` is numbered per index type, apart from the layout versions above:
+`IVF_RQ` writes 2, and `IVF_HNSW_RQ` writes 3 because its auxiliary file adds the
+`__sym_*` columns. A reader ignores an index whose `index_version` is newer than it
+supports.
 
 ## Storage Layout (V3)
 
