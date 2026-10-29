@@ -211,6 +211,7 @@ def test_large_k_auto_probe_initial_budget(tmp_path, monkeypatch, metric, k, seg
         ("IVF_HNSW_FLAT", {}, np.float32, None),
         ("IVF_HNSW_PQ", {"num_sub_vectors": 16, "num_bits": 4}, np.float32, None),
         ("IVF_HNSW_SQ", {}, np.float32, None),
+        ("IVF_HNSW_RQ", {"num_bits": 5}, np.float32, None),
         ("IVF_FLAT", {}, np.float16, None),
         ("IVF_FLAT", {}, np.float64, None),
         ("IVF_FLAT", {}, np.float32, 2),
@@ -4046,8 +4047,9 @@ def test_commit_existing_index_segments_accepts_index_metadata(tmp_path):
     assert 0 < len(results) <= 5
 
 
-def test_distributed_ivf_rq_shared_rotation(tmp_path):
-    """Two IVF_RQ segments built on separate fragments with one shared RaBitQ rotation
+@pytest.mark.parametrize("index_type", ["IVF_RQ", "IVF_HNSW_RQ"])
+def test_distributed_ivf_rq_shared_rotation(tmp_path, index_type):
+    """Two RQ segments built on separate fragments with one shared RaBitQ rotation
     merge into a single committed, queryable index. The shared ``rabitq_model`` (from
     ``lance.lance.indices.build_rq_model``) is what makes the independently built
     segments mergeable."""
@@ -4069,7 +4071,7 @@ def test_distributed_ivf_rq_shared_rotation(tmp_path):
     rabitq_model = indices.build_rq_model(dimension=dim, num_bits=1)
     base_kwargs = {
         "column": "vector",
-        "index_type": "IVF_RQ",
+        "index_type": index_type,
         "num_partitions": 2,
         "num_bits": 1,
         "ivf_centroids": ivf_model.centroids,

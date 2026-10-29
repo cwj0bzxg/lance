@@ -7,14 +7,19 @@ fn build_rq_num_bits(index_type: &str, num_bits: Option<i32>) -> Result<u8> {
     let mut request = CreateTableIndexRequest::new("vector".to_string(), index_type.to_string());
     request.num_bits = num_bits;
 
-    let DirectoryIndexParams::Vector { params, .. } =
-        DirectoryNamespace::build_index_params(&request)?
+    let DirectoryIndexParams::Vector {
+        index_type: built,
+        params,
+    } = DirectoryNamespace::build_index_params(&request)?
     else {
         panic!("expected {index_type} vector index params");
     };
-    match params.stages.as_slice() {
-        [StageParams::Ivf(_), .., StageParams::RQ(rq)] => Ok(rq.num_bits),
-        stages => panic!("expected IVF and RQ stages, got {stages:?}"),
+    // The stage shape decides the index that gets built.
+    assert_eq!(built.to_string(), index_type);
+    assert_eq!(params.index_type(), built);
+    match params.stages.last() {
+        Some(StageParams::RQ(rq)) => Ok(rq.num_bits),
+        stages => panic!("expected an RQ stage, got {stages:?}"),
     }
 }
 

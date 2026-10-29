@@ -61,6 +61,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::prefilter::{NoFilter, PreFilter};
 use lance_index::progress::IndexBuildProgress;
 use lance_index::vector::DIST_COL;
+use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::flat::storage::FlatFloatStorage;
 use lance_index::vector::hnsw::builder::{HNSW_METADATA_KEY, HnswBuildParams};
@@ -68,7 +69,7 @@ use lance_index::vector::hnsw::{HNSW, HnswMetadata};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
-use lance_index::vector::quantizer::QuantizerMetadata;
+use lance_index::vector::quantizer::{Quantization, QuantizerMetadata};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
@@ -2631,6 +2632,7 @@ async fn test_distributed_vector_build_supports_hnsw_variants() {
 #[case::flat("IVF_HNSW_FLAT")]
 #[case::pq("IVF_HNSW_PQ")]
 #[case::sq("IVF_HNSW_SQ")]
+#[case::rq("IVF_HNSW_RQ")]
 #[tokio::test]
 async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index_type: &str) {
     let test_dir = TempStrDir::default();
@@ -2680,6 +2682,24 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index
             HnswBuildParams::default(),
             SQBuildParams::default(),
         ),
+        "IVF_HNSW_RQ" => {
+            // Shards merge only if they rotate vectors the same way.
+            let rotation = RabitQuantizer::new_with_rotation::<Float32Type>(
+                5,
+                TWO_FRAG_DIM as i32,
+                RQRotationType::Fast,
+            )
+            .metadata(None);
+            VectorIndexParams::with_ivf_hnsw_rq_params(
+                DistanceType::L2,
+                prepare_global_ivf(&dataset, "vector").await,
+                HnswBuildParams::default(),
+                RQBuildParams {
+                    rotation: Some(rotation),
+                    ..RQBuildParams::with_rotation_type(5, RQRotationType::Fast)
+                },
+            )
+        }
         other => panic!("unexpected HNSW index type {other}"),
     };
     let mut segments = Vec::new();
@@ -3613,14 +3633,26 @@ async fn test_build_ivf_rq_multi_bit_persists_split_codes_and_searches(
 #[case::fast(RQRotationType::Fast)]
 #[case::matrix(RQRotationType::Matrix)]
 #[tokio::test]
-async fn test_ivf_rq_rotation_type_after_optimize(#[case] rotation_type: RQRotationType) {
+async fn test_ivf_rq_rotation_type_after_optimize(
+    #[case] rotation_type: RQRotationType,
+    #[values(false, true)] hnsw: bool,
+) {
     let test_dir = TempStrDir::default();
     let test_uri = test_dir.as_str();
     let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
     let ivf_params = IvfBuildParams::new(4);
     let rq_params = RQBuildParams::with_rotation_type(1, rotation_type);
-    let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
+    let params = if hnsw {
+        VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            ivf_params,
+            HnswBuildParams::default(),
+            rq_params,
+        )
+    } else {
+        VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params)
+    };
     dataset
         .create_index(&["vector"], IndexType::Vector, None, &params, true)
         .await
@@ -3729,6 +3761,9 @@ async fn test_create_ivf_hnsw_rq(
     );
     // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
     Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+    if distance_type == DistanceType::Cosine {
+        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+    }
     // test_distance_range pins the row-id order of range splits against the
     // unfiltered top-k, which a 1-bit walk need not reproduce for every k.
     Box::pin(test_delete_all_rows(params.clone())).await;
@@ -3792,7 +3827,7 @@ async fn test_ivf_hnsw_rq_nonzero_centroid_keeps_raw_query(
         .unwrap();
     let ivf = index
         .as_any()
-        .downcast_ref::<super::IVFIndex<HNSW, lance_index::vector::bq::builder::RabitQuantizer>>()
+        .downcast_ref::<super::IVFIndex<HNSW, RabitQuantizer>>()
         .expect("IVF_HNSW_RQ");
     assert_eq!(
         ivf.ivf_model().centroids_array().unwrap().value_type(),
@@ -6433,6 +6468,15 @@ impl lance_core::cache::CacheBackend for PartitionBypassCacheBackend {
             SQBuildParams::default(),
         ),
         <PartitionEntry<HNSW, ScalarQuantizer> as CacheCodecImpl>::TYPE_ID
+    )]
+#[case::ivf_hnsw_rq(
+        VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        ),
+        <PartitionEntry<HNSW, RabitQuantizer> as CacheCodecImpl>::TYPE_ID
     )]
 #[tokio::test]
 async fn test_prewarm_and_query_with_serializing_backend(
