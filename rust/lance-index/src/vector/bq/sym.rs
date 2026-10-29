@@ -128,12 +128,7 @@ pub struct SymCode<'a> {
 }
 
 fn split_sign_bit(signs: &[u8], dim: usize) -> u32 {
-    let offset = (dim / 64) * 8;
-    let word = u64::from_le_bytes(
-        signs[offset..offset + 8]
-            .try_into()
-            .expect("8-byte sign word"),
-    );
+    let word = u64::from_le_bytes(signs.as_chunks::<8>().0[dim / 64]);
     ((word >> (63 - (dim % 64))) & 1) as u32
 }
 
@@ -204,15 +199,10 @@ fn centered_code_ip_scalar_4ex(
     let mut ip_uu = 0i64;
     let mut sum_a = 0i64;
     let mut sum_b = 0i64;
+    let (words_a, words_b) = (signs_a.as_chunks::<8>().0, signs_b.as_chunks::<8>().0);
     for w in 0..dim / 64 {
-        let word = |signs: &[u8]| {
-            u64::from_le_bytes(
-                signs[w * 8..w * 8 + 8]
-                    .try_into()
-                    .expect("8-byte sign word"),
-            )
-        };
-        let (sa, sb) = (word(signs_a), word(signs_b));
+        let sa = u64::from_le_bytes(words_a[w]);
+        let sb = u64::from_le_bytes(words_b[w]);
         let pa = &ex_a[w * 32..w * 32 + 32];
         let pb = &ex_b[w * 32..w * 32 + 32];
         for g in 0..4 {

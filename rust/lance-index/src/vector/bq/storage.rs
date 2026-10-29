@@ -701,19 +701,6 @@ impl RabitQuantizationStorage {
         })
     }
 
-    /// Switches a query calculator of `IVF_HNSW_RQ` to the 1-bit warmup walk.
-    /// `rerank` and `dist_calculator_from_id` build theirs without it.
-    fn enable_sym_walk<'a>(&'a self, calc: &mut RabitDistCalculator<'a>) {
-        if let Some(sym) = &self.sym {
-            let rotated = &calc.ex_query.as_ref()[..calc.dim];
-            calc.sym_walk = Some(SymWalk {
-                signs: sym.signs.values(),
-                stride: sign_word_bytes(calc.dim),
-                query: prepare_residual_warmup_query(rotated, sym.t_const),
-            });
-        }
-    }
-
     fn residual_query_factor(&self, dist_q_c: f32) -> f32 {
         match self.distance_type {
             DistanceType::L2 | DistanceType::Cosine => dist_q_c,
@@ -2508,7 +2495,16 @@ impl VectorStore for RabitQuantizationStorage {
     #[inline(never)]
     fn dist_calculator(&self, qr: Arc<dyn Array>, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let mut calc = self.code_calculator(qr.as_ref(), dist_q_c);
-        self.enable_sym_walk(&mut calc);
+        // `IVF_HNSW_RQ` walks its graph on the 1-bit warmup; `rerank` and
+        // `dist_calculator_from_id` build their calculators without it.
+        if let Some(sym) = &self.sym {
+            let rotated = &calc.ex_query.as_ref()[..calc.dim];
+            calc.sym_walk = Some(SymWalk {
+                signs: sym.signs.values(),
+                stride: sign_word_bytes(calc.dim),
+                query: prepare_residual_warmup_query(rotated, sym.t_const),
+            });
+        }
         calc
     }
 
@@ -2535,7 +2531,7 @@ impl VectorStore for RabitQuantizationStorage {
             debug_assert_eq!(raw_query.ex_bits, self.metadata.num_bits - 1);
             let query_factors =
                 self.raw_query_factors(dist_q_c, &raw_query.rotated_query, rotated_centroid);
-            let mut calc = self.distance_calculator_from_parts(RabitDistCalculatorParts {
+            return self.distance_calculator_from_parts(RabitDistCalculatorParts {
                 dim: code_dim,
                 dist_table: Cow::Borrowed(&raw_query.dist_table),
                 ex_query: Cow::Borrowed(kernel_query(
@@ -2546,8 +2542,6 @@ impl VectorStore for RabitQuantizationStorage {
                 query_factors,
                 approx_mode: options.approx_mode,
             });
-            self.enable_sym_walk(&mut calc);
-            return calc;
         }
 
         let dist_table_len = code_dim * 4;
@@ -2603,7 +2597,7 @@ impl VectorStore for RabitQuantizationStorage {
         };
 
         let ex_query_start = code_dim + dist_table_len;
-        let mut calc = self.distance_calculator_from_parts(RabitDistCalculatorParts {
+        self.distance_calculator_from_parts(RabitDistCalculatorParts {
             dim: code_dim,
             dist_table: Cow::Borrowed(&f32_scratch[code_dim..ex_query_start]),
             ex_query: Cow::Borrowed(kernel_query(
@@ -2613,9 +2607,7 @@ impl VectorStore for RabitQuantizationStorage {
             sum_q,
             query_factors,
             approx_mode: options.approx_mode,
-        });
-        self.enable_sym_walk(&mut calc);
-        calc
+        })
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
