@@ -446,6 +446,14 @@ pub fn derive_vector_index_type(details: &prost_types::Any) -> String {
     index_type
 }
 
+/// Whether the details describe an IVF_HNSW_RQ index, which always records its
+/// HNSW config and RQ compression.
+pub fn is_ivf_hnsw_rq(details: &prost_types::Any) -> bool {
+    details.to_msg::<VectorIndexDetails>().is_ok_and(|d| {
+        d.hnsw_index_config.is_some() && matches!(d.compression, Some(Compression::Rq(_)))
+    })
+}
+
 /// Serialize VectorIndexDetails as a JSON string.
 pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
     if is_empty_vector_details(details) {
@@ -824,6 +832,35 @@ mod tests {
             )),
             "IVF_HNSW_SQ"
         );
+    }
+
+    /// Only IVF_HNSW_RQ reads past the shared vector version, so this build
+    /// still skips newer segments of every other subtype.
+    #[test]
+    fn test_only_ivf_hnsw_rq_gets_its_own_index_version() {
+        let hnsw = Some(HnswParameters {
+            max_connections: 20,
+            construction_ef: 150,
+            max_level: 7,
+        });
+        let rq = || {
+            Some(Compression::Rq(RabitQuantization {
+                num_bits: 5,
+                rotation_type: 0,
+            }))
+        };
+        let version = |hnsw, compression| {
+            let details = make_details(VectorMetricType::L2, hnsw, compression);
+            crate::index::scalar::IndexDetails(Arc::new(details))
+                .index_version()
+                .unwrap()
+        };
+        let shared = lance_index::IndexType::max_vector_version();
+        let own = lance_index::IndexType::IvfHnswRq.version() as u32;
+        assert!(own > shared);
+        assert_eq!(version(hnsw, rq()), own);
+        assert_eq!(version(None, rq()), shared);
+        assert_eq!(version(hnsw, None), shared);
     }
 
     #[test]

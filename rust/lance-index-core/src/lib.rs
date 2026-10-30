@@ -258,7 +258,14 @@ impl IndexType {
             | Self::IvfHnswSq
             | Self::IvfHnswPq
             | Self::IvfHnswFlat => 1,
-            Self::IvfRq | Self::IvfHnswRq => 2,
+            Self::IvfRq => 2,
+            // Builds without an IVF_HNSW_RQ reader accept vector versions up to
+            // 2, so 3 makes them skip it and query the table instead. The
+            // compatibility check tells IVF_HNSW_RQ apart by its details and
+            // grants this level to it alone, so `max_vector_version` leaves it
+            // out. From version 3 the format stores row addresses, which
+            // `_rowid` holds because IVF_HNSW_RQ refuses stable row ids.
+            Self::IvfHnswRq => 3,
         }
     }
 
@@ -283,7 +290,8 @@ impl IndexType {
         }
     }
 
-    /// Returns the highest supported vector index version in this Lance build.
+    /// Returns the highest supported vector index version in this Lance build,
+    /// apart from IVF_HNSW_RQ's own (see [`Self::version`]).
     pub fn max_vector_version() -> u32 {
         [
             Self::Vector,
@@ -294,7 +302,6 @@ impl IndexType {
             Self::IvfHnswPq,
             Self::IvfHnswFlat,
             Self::IvfRq,
-            Self::IvfHnswRq,
         ]
         .into_iter()
         .map(|index_type| index_type.version() as u32)

@@ -4568,6 +4568,7 @@ impl Dataset {
                     },
 
                     "IVF_HNSW_RQ" => {
+                        vector::check_ivf_hnsw_rq_row_domain(self)?;
                         let ivf = IVFIndex::<HNSW, RabitQuantizer>::try_new(
                             object_store.clone(),
                             index_dir,

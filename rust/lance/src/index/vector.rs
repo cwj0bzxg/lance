@@ -733,6 +733,18 @@ pub(crate) fn vector_quantizer_minimum_rows(stages: &[StageParams]) -> Option<us
     })
 }
 
+/// IVF_HNSW_RQ keeps row ids in `_rowid`, which its index version gives the
+/// meaning of row addresses, so it serves only datasets without stable row ids,
+/// where the two are the same value.
+pub(crate) fn check_ivf_hnsw_rq_row_domain(dataset: &Dataset) -> Result<()> {
+    if dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::not_supported(
+            "IVF_HNSW_RQ does not support datasets with stable row ids yet",
+        ));
+    }
+    Ok(())
+}
+
 /// Prepare the shared build inputs used by both direct local builds and
 /// staged shard builds.
 ///
@@ -787,6 +799,9 @@ async fn prepare_vector_segment_build(
     }
 
     let index_type = params.index_type();
+    if index_type == IndexType::IvfHnswRq {
+        check_ivf_hnsw_rq_row_domain(dataset)?;
+    }
     if matches!(index_type, IndexType::IvfRq | IndexType::IvfHnswRq) {
         let Some(StageParams::RQ(rq_params)) = stages.last() else {
             return Err(Error::index(format!(

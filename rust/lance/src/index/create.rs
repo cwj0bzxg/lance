@@ -4906,7 +4906,10 @@ mod tests {
     #[case::ivf_rq(IndexType::IvfRq)]
     #[case::ivf_hnsw_rq(IndexType::IvfHnswRq)]
     #[tokio::test]
-    async fn test_create_index_ivf_rq_preserves_index_version(#[case] index_type: IndexType) {
+    async fn test_create_index_ivf_rq_preserves_index_version(
+        #[case] index_type: IndexType,
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -4920,10 +4923,15 @@ mod tests {
                 lance_datagen::RowCount::from(128),
                 lance_datagen::BatchCount::from(2),
             );
-        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+        let write_params = WriteParams {
+            enable_stable_row_ids,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, &dataset_uri, Some(write_params))
+            .await
+            .unwrap();
 
         let params = match index_type {
-            // IVF_HNSW_RQ persists the IVF_RQ format, so it records IVF_RQ's version.
             IndexType::IvfHnswRq => VectorIndexParams::with_ivf_hnsw_rq_params(
                 DistanceType::L2,
                 IvfBuildParams::new(4),
@@ -4933,16 +4941,22 @@ mod tests {
             _ => VectorIndexParams::ivf_rq(4, 1, DistanceType::L2),
         };
 
-        let committed = dataset
+        let created = dataset
             .create_index(&["vector"], index_type, None, &params, false)
-            .await
-            .unwrap();
+            .await;
+        // Stable row ids are not the row addresses IVF_HNSW_RQ's version means.
+        if index_type == IndexType::IvfHnswRq && enable_stable_row_ids {
+            let err = created.unwrap_err();
+            assert!(err.to_string().contains("stable row ids"), "{err}");
+            return;
+        }
+        let committed = created.unwrap();
 
-        assert_eq!(committed.index_version, IndexType::IvfRq.version());
+        assert_eq!(committed.index_version, index_type.version());
 
         let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].index_version, IndexType::IvfRq.version());
+        assert_eq!(loaded[0].index_version, index_type.version());
     }
 
     #[tokio::test]
